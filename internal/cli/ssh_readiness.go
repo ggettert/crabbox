@@ -98,7 +98,7 @@ func runSSHReadinessProbe(ctx context.Context, target SSHTarget, remote, connect
 }
 
 func canWaitForLinuxReadiness(target SSHTarget) bool {
-	return target.TargetOS == targetLinux && !target.SSHConfigProxy && target.SSHConfigFile == "" && target.ProxyCommand == ""
+	return target.TargetOS == targetLinux && !usesSSHProxyTransport(target) && target.SSHConfigFile == ""
 }
 
 func linuxReadinessWaitCommand(target SSHTarget, timeout time.Duration) string {

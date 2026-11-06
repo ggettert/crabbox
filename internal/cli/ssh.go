@@ -100,6 +100,10 @@ func isLocalHost(host string) bool {
 	return host == name || host == short
 }
 
+func usesSSHProxyTransport(target SSHTarget) bool {
+	return target.SSHConfigProxy || strings.TrimSpace(target.ProxyCommand) != ""
+}
+
 func sshTargetFromConfig(cfg Config, host string) SSHTarget {
 	return sshTargetForLease(cfg, host, cfg.SSHUser, cfg.SSHPort)
 }
@@ -452,7 +456,7 @@ func waitForSSHReadyWithProbeContext(ctx, probeCtx context.Context, target *SSHT
 			}
 			lastPorts = "wsl2"
 			fmt.Fprintln(stderr, sshWaitProgressMessage(target, phase, "", "", lastPorts, time.Since(start), time.Until(deadline)))
-		} else if target.SSHConfigProxy {
+		} else if usesSSHProxyTransport(*target) {
 			lastProbe = "readiness"
 			err := probeProxySSHReady(probeCtx, target, profile)
 			if stopped := check(err); stopped != nil {
@@ -650,7 +654,7 @@ func ProbeSSHReady(ctx context.Context, target *SSHTarget, timeout time.Duration
 	if isWindowsWSL2Target(*target) {
 		return probeWSL2SSHReady(ctx, target, profile, io.Discard) == nil
 	}
-	if target.SSHConfigProxy {
+	if usesSSHProxyTransport(*target) {
 		return probeProxySSHReady(ctx, target, profile) == nil
 	}
 	for _, port := range sshPortCandidates(target.Port, target.FallbackPorts) {
@@ -831,7 +835,7 @@ func probeSSHTransport(ctx context.Context, target *SSHTarget, timeout time.Dura
 		}
 		return false
 	}
-	if target.SSHConfigProxy {
+	if usesSSHProxyTransport(*target) {
 		return runSSHQuietWithOptionsResolvePort(ctx, target, sshTransportProbeCommand(*target), "2", "1") == nil
 	}
 	for _, port := range sshPortCandidates(target.Port, target.FallbackPorts) {

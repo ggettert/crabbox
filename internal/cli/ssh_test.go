@@ -1931,6 +1931,106 @@ exit 0
 	}
 }
 
+func TestProxyCommandReadinessUsesSSHTransportWithoutConfigProxy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX fake SSH fixture")
+	}
+	const proxyCommand = "aws ssm start-session --target %h --parameters portNumber=%p"
+	for _, test := range []struct {
+		name   string
+		remote string
+		run    func(context.Context, *SSHTarget) bool
+	}{
+		{name: "wait", remote: "marker-probe", run: func(ctx context.Context, target *SSHTarget) bool {
+			return waitForSSHReady(ctx, target, io.Discard, "test", time.Second) == nil
+		}},
+		{name: "probe", remote: "marker-probe", run: func(ctx context.Context, target *SSHTarget) bool {
+			return ProbeSSHReady(ctx, target, time.Second)
+		}},
+		{name: "transport probe", remote: "exit 0", run: func(ctx context.Context, target *SSHTarget) bool {
+			return probeSSHTransport(ctx, target, time.Second)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			callsPath := installProxyCommandReadinessFakeSSH(t)
+			t.Setenv("CRABBOX_EXPECTED_PROXY_COMMAND", proxyCommand)
+			t.Setenv("CRABBOX_FAKE_SSH_READY", "1")
+			target := SSHTarget{
+				User:          "crabbox",
+				Host:          "i-0123456789abcdef0",
+				Port:          "22",
+				FallbackPorts: []string{},
+				ProxyCommand:  proxyCommand,
+				ReadyCheck:    "marker-probe",
+			}
+			if !test.run(t.Context(), &target) {
+				t.Fatal("readiness did not use the ProxyCommand transport")
+			}
+			calls, err := os.ReadFile(callsPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := string(calls), proxyCommand+"\t"+test.remote+"\n"; got != want {
+				t.Fatalf("SSH calls=%q want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestProxyCommandReadinessFailureDoesNotFallBackToDirectDial(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX fake SSH fixture")
+	}
+	const proxyCommand = "aws ssm start-session --target %h --parameters portNumber=%p"
+	callsPath := installProxyCommandReadinessFakeSSH(t)
+	t.Setenv("CRABBOX_EXPECTED_PROXY_COMMAND", proxyCommand)
+	target := SSHTarget{
+		User:          "crabbox",
+		Host:          "i-0123456789abcdef0",
+		Port:          "22",
+		FallbackPorts: []string{},
+		ProxyCommand:  proxyCommand,
+		ReadyCheck:    "marker-probe",
+	}
+	err := waitForSSHReady(t.Context(), &target, io.Discard, "test", 100*time.Millisecond)
+	if err == nil || ExitCodeForError(err, 1) != 5 || !strings.Contains(err.Error(), "timed out waiting for SSH on i-0123456789abcdef0") {
+		t.Fatalf("waitForSSHReady error=%v exit=%d, want fail-closed readiness timeout", err, ExitCodeForError(err, 1))
+	}
+	calls, readErr := os.ReadFile(callsPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !strings.Contains(string(calls), proxyCommand+"\tmarker-probe\n") || !strings.Contains(string(calls), proxyCommand+"\texit 0\n") {
+		t.Fatalf("SSH calls did not preserve the proxy route for readiness and transport probes: %q", calls)
+	}
+}
+
+func installProxyCommandReadinessFakeSSH(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	callsPath := filepath.Join(dir, "calls")
+	script := `#!/bin/sh
+proxy=
+remote=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    ProxyCommand=*) proxy=${1#ProxyCommand=} ;;
+  esac
+  remote=$1
+  shift
+done
+printf '%s\t%s\n' "$proxy" "$remote" >> "$CRABBOX_FAKE_SSH_CALLS"
+[ "$proxy" = "$CRABBOX_EXPECTED_PROXY_COMMAND" ] || exit 97
+[ "$CRABBOX_FAKE_SSH_READY" = "1" ] || exit 255
+`
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CRABBOX_FAKE_SSH_CALLS", callsPath)
+	return callsPath
+}
+
 func TestProxySSHReadinessPreservesCandidatesUntilSuccessfulProbe(t *testing.T) {
 	dir := t.TempDir()
 	sshPath := filepath.Join(dir, "ssh")
