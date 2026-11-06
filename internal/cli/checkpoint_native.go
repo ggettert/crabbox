@@ -910,21 +910,22 @@ func nativeCoordinatorImageRef(record checkpointRecord) CoordinatorImageRef {
 
 func nativeCheckpointForkRecord(record checkpointRecord) NativeCheckpointForkRecord {
 	return NativeCheckpointForkRecord{
-		ArtifactDir:  record.artifactDir,
-		Kind:         record.Kind,
-		ImageID:      record.Native.ImageID,
-		Name:         record.Native.Name,
-		Resource:     record.Native.Resource,
-		Region:       record.Native.Region,
-		Project:      record.Native.Project,
-		Direct:       record.Native.Direct,
-		HostID:       record.HostID,
-		TargetOS:     record.TargetOS,
-		WindowsMode:  record.WindowsMode,
-		Desktop:      record.Desktop,
-		ServerType:   record.ServerType,
-		Architecture: record.Native.Architecture,
-		Metadata:     record.Native.Metadata,
+		ArtifactDir:    record.artifactDir,
+		Kind:           record.Kind,
+		ImageID:        record.Native.ImageID,
+		Name:           record.Native.Name,
+		Resource:       record.Native.Resource,
+		Region:         record.Native.Region,
+		Project:        record.Native.Project,
+		Direct:         record.Native.Direct,
+		HostID:         record.HostID,
+		TargetOS:       record.TargetOS,
+		WindowsMode:    record.WindowsMode,
+		Desktop:        record.Desktop,
+		ServerType:     record.ServerType,
+		Architecture:   record.Native.Architecture,
+		AccessMetadata: copyStringMap(record.Native.AccessMetadata),
+		Metadata:       record.Native.Metadata,
 	}
 }
 

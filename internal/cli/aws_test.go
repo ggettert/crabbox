@@ -1168,6 +1168,23 @@ func TestAWSWaitForServerIPWaitsForCreatedInstanceVisibility(t *testing.T) {
 	}
 }
 
+func TestAWSWaitForServerVisibleDoesNotRequirePublicIP(t *testing.T) {
+	const instanceID = "i-1234567890abcdef0"
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		writeEC2XML(w, `<DescribeInstancesResponse><reservationSet><item><instancesSet><item><instanceId>`+instanceID+`</instanceId><instanceType>t3.micro</instanceType><privateIpAddress>10.0.1.20</privateIpAddress><instanceState><name>pending</name></instanceState></item></instancesSet></item></reservationSet></DescribeInstancesResponse>`)
+	}))
+	t.Cleanup(server.Close)
+	observed, err := testAWSClient(server.URL).WaitForServerVisible(t.Context(), instanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || observed.CloudID != instanceID || observed.PublicNet.IPv4.IP != "" {
+		t.Fatalf("observed=%#v calls=%d", observed, calls)
+	}
+}
+
 func TestAWSWaitForServerIPRejectsNonVisibilityErrors(t *testing.T) {
 	for _, code := range []string{"UnauthorizedOperation", "InvalidInstanceID.Malformed", ""} {
 		t.Run(code, func(t *testing.T) {
@@ -1631,6 +1648,119 @@ func TestAWSMacOSFallbackResolvesAMIForEachInstanceType(t *testing.T) {
 	}
 	if len(runTypes) != len(awsMacOSInstanceTypeCandidates()) || runTypes[0] != "mac2.metal" || runTypes[len(runTypes)-1] != "mac1.metal" {
 		t.Fatalf("run type sequence=%v, want macOS fallback list ending with mac1", runTypes)
+	}
+}
+
+func TestAWSSSMRunInstancesDisablesPublicIP(t *testing.T) {
+	var run url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		params, err := url.ParseQuery(string(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if action := params.Get("Action"); action != "RunInstances" {
+			writeEC2Error(w, "Unexpected", action, http.StatusBadRequest)
+			return
+		}
+		run = params
+		writeEC2XML(w, `<RunInstancesResponse><instancesSet><item><instanceId>i-private</instanceId><instanceType>t3.small</instanceType><instanceState><name>pending</name></instanceState><subnetId>subnet-private</subnetId><groupSet><item><groupId>sg-private</groupId></item></groupSet></item></instancesSet></RunInstancesResponse>`)
+	}))
+	defer server.Close()
+	cfg := baseConfig()
+	cfg.Provider = "aws"
+	cfg.TargetOS = targetLinux
+	cfg.AWSRegion = "eu-west-1"
+	cfg.AWSSSHTransport = AWSSSHTransportSSM
+	cfg.AWSSubnetID = "subnet-private"
+	cfg.AWSRootGB = 40
+	cfg.ServerType = "t3.small"
+	cfg.ProviderKey = "crabbox-private"
+	client := testAWSClient(server.URL)
+	created, err := client.createServer(t.Context(), cfg, testOpenSSHPublicKey("ssh-ed25519", testBytes(32, 5)), "cbx_abcdef123456", "private", true, "ami-private", "sg-private", false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.PublicNet.IPv4.IP != "" || created.Labels["aws_ssh_transport"] != AWSSSHTransportSSM {
+		t.Fatalf("created=%#v", created)
+	}
+	if len(created.Labels) != 1 {
+		t.Fatalf("fresh RunInstances return fabricated unobserved ownership labels: %v", created.Labels)
+	}
+	transportTag := false
+	for name := range run {
+		if strings.HasSuffix(name, ".Key") && run.Get(name) == "aws_ssh_transport" && run.Get(strings.TrimSuffix(name, ".Key")+".Value") == AWSSSHTransportSSM {
+			transportTag = true
+		}
+	}
+	if !transportTag {
+		t.Fatal("RunInstances omitted aws_ssh_transport=ssm tag")
+	}
+	if publicIP, subnetID, securityGroupID := run.Get("NetworkInterface.1.AssociatePublicIpAddress"), run.Get("NetworkInterface.1.SubnetId"), run.Get("NetworkInterface.1.SecurityGroupId.1"); publicIP != "false" || subnetID != "subnet-private" || securityGroupID != "sg-private" {
+		t.Fatalf("network interface parameters: associatePublicIp=%q subnet=%q securityGroup=%q", publicIP, subnetID, securityGroupID)
+	}
+	if securityGroupID := run.Get("SecurityGroupId.1"); securityGroupID != "" {
+		t.Fatalf("top-level security group unexpectedly used: %q", securityGroupID)
+	}
+}
+
+func TestAWSSSMSecurityGroupDoesNotMutateIngress(t *testing.T) {
+	var actions []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		action := r.Form.Get("Action")
+		actions = append(actions, action)
+		switch action {
+		case "DescribeSecurityGroups":
+			writeEC2XML(w, `<DescribeSecurityGroupsResponse><securityGroupInfo><item><groupId>sg-private</groupId><ipPermissions><item><ipProtocol>tcp</ipProtocol><fromPort>22</fromPort><toPort>22</toPort><ipRanges><item><cidrIp>0.0.0.0/0</cidrIp><description>`+awsSSHIngressDescription+`</description></item></ipRanges></item></ipPermissions></item></securityGroupInfo></DescribeSecurityGroupsResponse>`)
+		default:
+			writeEC2Error(w, "Unexpected", action, http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	groupID, err := testAWSClient(server.URL).ensureSecurityGroup(t.Context(), Config{
+		Provider: "aws", AWSSSHTransport: AWSSSHTransportSSM, AWSSGID: "sg-private", SSHPort: "22", AWSSSHCIDRs: []string{"198.51.100.10/32"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if groupID != "sg-private" || !slices.Equal(actions, []string{"DescribeSecurityGroups"}) {
+		t.Fatalf("group=%q actions=%v", groupID, actions)
+	}
+}
+
+func TestAWSSSMDefaultSecurityGroupUsesSeparateName(t *testing.T) {
+	var groupNames []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		switch action := r.Form.Get("Action"); action {
+		case "DescribeVpcs":
+			writeEC2XML(w, `<DescribeVpcsResponse><vpcSet><item><vpcId>vpc-default</vpcId></item></vpcSet></DescribeVpcsResponse>`)
+		case "DescribeSecurityGroups":
+			for key, values := range r.Form {
+				if strings.Contains(key, "Filter") {
+					groupNames = append(groupNames, values...)
+				}
+			}
+			writeEC2XML(w, `<DescribeSecurityGroupsResponse><securityGroupInfo><item><groupId>sg-ssm-default</groupId></item></securityGroupInfo></DescribeSecurityGroupsResponse>`)
+		default:
+			writeEC2Error(w, "Unexpected", action, http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	groupID, err := testAWSClient(server.URL).ensureSecurityGroup(t.Context(), Config{Provider: "aws", AWSSSHTransport: AWSSSHTransportSSM})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if groupID != "sg-ssm-default" || !slices.Contains(groupNames, "crabbox-runners-ssm") {
+		t.Fatalf("group=%q filters=%v", groupID, groupNames)
 	}
 }
 

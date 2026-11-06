@@ -33,6 +33,8 @@ type fakeAWSClient struct {
 	createCfg        core.Config
 	createErr        error
 	waitErr          error
+	waitCalls        int
+	readyWaitCalls   int
 	acquireStateErr  error
 	get              map[string]core.Server
 	getErrs          map[string]error
@@ -112,6 +114,17 @@ func (c *fakeAWSClient) CreateServerWithFallbackControl(ctx context.Context, cfg
 func (c *fakeAWSClient) WaitForServerIP(context.Context, string) (core.Server, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.waitCalls++
+	if c.waitErr != nil {
+		return core.Server{}, c.waitErr
+	}
+	return c.created, nil
+}
+
+func (c *fakeAWSClient) WaitForServerVisible(context.Context, string) (core.Server, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.readyWaitCalls++
 	if c.waitErr != nil {
 		return core.Server{}, c.waitErr
 	}
@@ -2661,10 +2674,10 @@ func TestAWSConfigShowCompletePassiveSection(t *testing.T) {
 		want  map[string]any
 		text  string
 	}{
-		{name: "nil", input: core.Config{}, want: map[string]any{"stockImage": false, "region": "", "ami": "", "securityGroupId": "", "subnetId": "", "instanceProfile": "", "rootGB": int32(0), "sshCIDRs": []string(nil)}, text: "aws region= root_gb=0 ssh_cidrs=-\n"},
-		{name: "empty", input: core.Config{AWSSSHCIDRs: []string{}}, want: map[string]any{"stockImage": false, "region": "", "ami": "", "securityGroupId": "", "subnetId": "", "instanceProfile": "", "rootGB": int32(0), "sshCIDRs": []string{}}, text: "aws region= root_gb=0 ssh_cidrs=-\n"},
-		{name: "raw-references-list", input: core.Config{AWSRegion: "raw-region", AWSAMI: "image-reference", AWSSGID: "group-reference", AWSSubnetID: "subnet-reference", AWSProfile: "guest-profile-reference", AWSRootGB: 2147483647, AWSSSHCIDRs: []string{"second", "first", "second", " "}}, want: map[string]any{"stockImage": false, "region": "raw-region", "ami": "image-reference", "securityGroupId": "group-reference", "subnetId": "subnet-reference", "instanceProfile": "guest-profile-reference", "rootGB": int32(2147483647), "sshCIDRs": []string{"second", "first", "second", " "}}, text: "aws region=raw-region root_gb=2147483647 ssh_cidrs=second,first,second, \n"},
-		{name: "whitespace-empty-elements", input: core.Config{AWSRegion: " ", AWSAMI: " ", AWSSGID: " ", AWSSubnetID: " ", AWSProfile: " ", AWSRootGB: -1, AWSSSHCIDRs: []string{"", ""}}, want: map[string]any{"stockImage": false, "region": " ", "ami": " ", "securityGroupId": " ", "subnetId": " ", "instanceProfile": " ", "rootGB": int32(-1), "sshCIDRs": []string{"", ""}}, text: "aws region=  root_gb=-1 ssh_cidrs=,\n"},
+		{name: "nil", input: core.Config{}, want: map[string]any{"stockImage": false, "region": "", "sshTransport": "direct", "ami": "", "securityGroupId": "", "subnetId": "", "instanceProfile": "", "rootGB": int32(0), "sshCIDRs": []string(nil)}, text: "aws region= ssh_transport=direct root_gb=0 ssh_cidrs=-\n"},
+		{name: "empty", input: core.Config{AWSSSHCIDRs: []string{}}, want: map[string]any{"stockImage": false, "region": "", "sshTransport": "direct", "ami": "", "securityGroupId": "", "subnetId": "", "instanceProfile": "", "rootGB": int32(0), "sshCIDRs": []string{}}, text: "aws region= ssh_transport=direct root_gb=0 ssh_cidrs=-\n"},
+		{name: "raw-references-list", input: core.Config{AWSRegion: "raw-region", AWSSSHTransport: "ssm", AWSAMI: "image-reference", AWSSGID: "group-reference", AWSSubnetID: "subnet-reference", AWSProfile: "guest-profile-reference", AWSRootGB: 2147483647, AWSSSHCIDRs: []string{"second", "first", "second", " "}}, want: map[string]any{"stockImage": false, "region": "raw-region", "sshTransport": "ssm", "ami": "image-reference", "securityGroupId": "group-reference", "subnetId": "subnet-reference", "instanceProfile": "guest-profile-reference", "rootGB": int32(2147483647), "sshCIDRs": []string{"second", "first", "second", " "}}, text: "aws region=raw-region ssh_transport=ssm root_gb=2147483647 ssh_cidrs=second,first,second, \n"},
+		{name: "whitespace-empty-elements", input: core.Config{AWSRegion: " ", AWSSSHTransport: " ", AWSAMI: " ", AWSSGID: " ", AWSSubnetID: " ", AWSProfile: " ", AWSRootGB: -1, AWSSSHCIDRs: []string{"", ""}}, want: map[string]any{"stockImage": false, "region": " ", "sshTransport": "direct", "ami": " ", "securityGroupId": " ", "subnetId": " ", "instanceProfile": " ", "rootGB": int32(-1), "sshCIDRs": []string{"", ""}}, text: "aws region=  ssh_transport=direct root_gb=-1 ssh_cidrs=,\n"},
 	} {
 		for _, selected := range []string{"aws", "static"} {
 			t.Run(tc.name+"/"+selected, func(t *testing.T) {
@@ -2676,7 +2689,7 @@ func TestAWSConfigShowCompletePassiveSection(t *testing.T) {
 				if section.JSONKey != "aws" || section.TextLabel != "aws" || !reflect.DeepEqual(section.Providers, []string{"aws"}) {
 					t.Fatalf("section metadata=%#v", section)
 				}
-				wantOrder := []string{"region", "ami", "stockImage", "securityGroupId", "subnetId", "instanceProfile", "rootGB", "sshCIDRs"}
+				wantOrder := []string{"region", "sshTransport", "ami", "stockImage", "securityGroupId", "subnetId", "instanceProfile", "rootGB", "sshCIDRs"}
 				if len(section.Fields) != len(wantOrder) {
 					t.Fatalf("field count=%d want %d", len(section.Fields), len(wantOrder))
 				}

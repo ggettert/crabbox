@@ -1996,6 +1996,27 @@ func TestNewCheckpointRecordUsesResolvedVersion(t *testing.T) {
 	}
 }
 
+func TestNewCheckpointRecordPreservesSourceAccessMetadata(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	record, _, err := newCheckpointRecord(
+		Repo{Name: "my-app"},
+		Config{Provider: "aws", AWSSSHTransport: AWSSSHTransportDirect},
+		Server{CloudID: "i-1234567890abcdef0", Provider: "aws"},
+		SSHTarget{TargetOS: targetLinux, AccessMetadata: map[string]string{"aws.sshTransport": AWSSSHTransportSSM}},
+		"cbx_123", "/work/cbx_123/my-app", "test checkpoint",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Native.AccessMetadata["aws.sshTransport"] != AWSSSHTransportSSM {
+		t.Fatalf("source access metadata=%v", record.Native.AccessMetadata)
+	}
+	fork := nativeCheckpointForkRecord(record)
+	if fork.AccessMetadata["aws.sshTransport"] != AWSSSHTransportSSM {
+		t.Fatalf("fork access metadata=%v", fork.AccessMetadata)
+	}
+}
+
 func TestNewCheckpointRecordStoresHostPinAndServerType(t *testing.T) {
 	cfg := baseConfig()
 	cfg.Provider = "aws"
@@ -3222,6 +3243,45 @@ func TestApplyAWSAMICheckpointForkConfigPreservesDirectMacHostPin(t *testing.T) 
 	}
 	if cfg.Capacity.Market != "on-demand" {
 		t.Fatalf("market=%q, want on-demand", cfg.Capacity.Market)
+	}
+}
+
+func TestApplyAWSAMICheckpointForkConfigPreservesSourceSSHTransport(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		metadata  map[string]string
+		current   string
+		want      string
+		wantError string
+	}{
+		{name: "SSM source overrides current direct", metadata: map[string]string{"aws.sshTransport": AWSSSHTransportSSM}, current: AWSSSHTransportDirect, want: AWSSSHTransportSSM},
+		{name: "legacy record defaults direct", current: AWSSSHTransportSSM, want: AWSSSHTransportDirect},
+		{name: "invalid persisted transport", metadata: map[string]string{"aws.sshTransport": "tunnel"}, wantError: "invalid persisted SSH transport"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fs := newFlagSet("checkpoint fork", io.Discard)
+			_ = fs.String("type", "", "provider type")
+			cfg := defaultConfig()
+			cfg.Provider = "hetzner"
+			cfg.TargetOS = targetLinux
+			cfg.AWSSSHTransport = test.current
+			record := checkpointRecord{Kind: checkpointKindAWSAMI, TargetOS: targetLinux}
+			record.Native.ImageID = "ami-12345678"
+			record.Native.AccessMetadata = test.metadata
+			err := applyNativeCheckpointForkConfig(&cfg, fs, record)
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("error=%v, want %q", err, test.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.AWSSSHTransport != test.want {
+				t.Fatalf("aws.sshTransport=%q, want %q", cfg.AWSSSHTransport, test.want)
+			}
+		})
 	}
 }
 

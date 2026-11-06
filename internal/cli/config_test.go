@@ -376,7 +376,7 @@ func TestFlatProviderEnvironmentInputTracking(t *testing.T) {
 
 	fields := map[string][]string{
 		"hetzner": {"CRABBOX_HETZNER_LOCATION", "CRABBOX_HETZNER_IMAGE", "CRABBOX_HETZNER_SSH_KEY"},
-		"aws":     {"CRABBOX_AWS_REGION", "AWS_REGION", "CRABBOX_AWS_AMI", "CRABBOX_AWS_SECURITY_GROUP_ID", "CRABBOX_AWS_SUBNET_ID", "CRABBOX_AWS_INSTANCE_PROFILE", "CRABBOX_AWS_ROOT_GB", "CRABBOX_AWS_MAC_HOST_ID", "CRABBOX_AWS_SSH_CIDRS"},
+		"aws":     {"CRABBOX_AWS_REGION", "AWS_REGION", "CRABBOX_AWS_SSH_TRANSPORT", "CRABBOX_AWS_AMI", "CRABBOX_AWS_SECURITY_GROUP_ID", "CRABBOX_AWS_SUBNET_ID", "CRABBOX_AWS_INSTANCE_PROFILE", "CRABBOX_AWS_ROOT_GB", "CRABBOX_AWS_MAC_HOST_ID", "CRABBOX_AWS_SSH_CIDRS"},
 		"azure":   {"CRABBOX_AZURE_BACKEND", "CRABBOX_AZURE_SUBSCRIPTION_ID", "AZURE_SUBSCRIPTION_ID", "CRABBOX_AZURE_TENANT_ID", "AZURE_TENANT_ID", "CRABBOX_AZURE_CLIENT_ID", "AZURE_CLIENT_ID", "CRABBOX_AZURE_LOCATION", "CRABBOX_AZURE_RESOURCE_GROUP", "CRABBOX_AZURE_IMAGE", "CRABBOX_AZURE_OS_DISK", "CRABBOX_AZURE_SNAPSHOT_SKU", "CRABBOX_AZURE_OS_DISK_SKU", "CRABBOX_AZURE_VNET", "CRABBOX_AZURE_SUBNET", "CRABBOX_AZURE_NSG", "CRABBOX_AZURE_SSH_CIDRS", "CRABBOX_AZURE_NETWORK"},
 		"gcp":     {"CRABBOX_GCP_PROJECT", "GOOGLE_CLOUD_PROJECT", "GCP_PROJECT_ID", "CRABBOX_GCP_ZONE", "CRABBOX_GCP_IMAGE", "CRABBOX_GCP_NETWORK", "CRABBOX_GCP_SUBNET", "CRABBOX_GCP_ROOT_GB", "CRABBOX_GCP_SERVICE_ACCOUNT", "CRABBOX_GCP_TAGS", "CRABBOX_GCP_SSH_CIDRS"},
 	}
@@ -13442,6 +13442,7 @@ func TestApplyFileConfigCloudProviderBranches(t *testing.T) {
 		Hetzner: &fileHetznerConfig{Location: "fsn1", Image: "ubuntu-24.04", SSHKey: "hetzner-key"},
 		AWS: &fileAWSConfig{
 			Region:          "eu-central-1",
+			SSHTransport:    "ssm",
 			AMI:             "ami-test",
 			SecurityGroupID: "sg-test",
 			SubnetID:        "subnet-test",
@@ -13483,7 +13484,7 @@ func TestApplyFileConfigCloudProviderBranches(t *testing.T) {
 	if cfg.Provider != "aws" || cfg.Access.ClientID != "access-id" || cfg.CoordToken != "coord-token" {
 		t.Fatalf("broker/access config not applied: provider=%s access=%#v token=%s", cfg.Provider, cfg.Access, cfg.CoordToken)
 	}
-	if cfg.Location != "fsn1" || cfg.ProviderKey != "hetzner-key" || cfg.HostID != "h-mac" || cfg.AWSRootGB != 123 {
+	if cfg.Location != "fsn1" || cfg.ProviderKey != "hetzner-key" || cfg.HostID != "h-mac" || cfg.AWSRootGB != 123 || cfg.AWSSSHTransport != "ssm" {
 		t.Fatalf("hetzner/aws config not applied: location=%s key=%s host=%s root=%d", cfg.Location, cfg.ProviderKey, cfg.HostID, cfg.AWSRootGB)
 	}
 	if cfg.Azure.OSDisk != "ephemeral" || !cfg.Azure.OSDiskExplicit || cfg.Azure.Network != "public" {

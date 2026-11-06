@@ -95,8 +95,8 @@
     "lifecycle": "Crabbox or coordinator",
     "cleanup": "instance termination",
     "bestFit": "Broad Linux, Windows, WSL2, and macOS cloud coverage",
-    "caveat": "Largest configuration, quota, and cost surface",
-    "auth": "Broker-owned credentials through coordinator, or AWS SDK credential chain in direct mode; AWS_PROFILE AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN",
+    "caveat": "Largest configuration, quota, and cost surface; SSH-over-SSM is direct Linux only and needs local AWS CLI plus Session Manager plugin",
+    "auth": "Broker-owned credentials through coordinator, or AWS SDK credential chain in direct mode; SSH-over-SSM requires the local AWS CLI to resolve the same caller credentials; AWS_PROFILE AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN",
     "docs": "aws.md"
   },
   "aws-lambda-microvm": {

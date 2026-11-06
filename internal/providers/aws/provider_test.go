@@ -308,3 +308,41 @@ func TestPrepareLeaseClaimEndpointPreservesCleanupIdentity(t *testing.T) {
 		t.Fatalf("labels=%v, must not promote mutable cloud tags into cleanup authority", prepared.Labels)
 	}
 }
+
+func TestApplyNativeCheckpointForkConfigRestoresSSHTransport(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		metadata  map[string]string
+		current   string
+		want      string
+		wantError string
+	}{
+		{name: "SSM source overrides current direct", metadata: map[string]string{awsCheckpointSSHTransportMetadata: core.AWSSSHTransportSSM}, current: core.AWSSSHTransportDirect, want: core.AWSSSHTransportSSM},
+		{name: "legacy record defaults direct", current: core.AWSSSHTransportSSM, want: core.AWSSSHTransportDirect},
+		{name: "invalid persisted transport", metadata: map[string]string{awsCheckpointSSHTransportMetadata: "tunnel"}, wantError: "invalid persisted SSH transport"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := core.Config{AWSSSHTransport: test.current}
+			err := (Provider{}).ApplyNativeCheckpointForkConfig(core.NativeCheckpointForkRequest{
+				Config: &cfg,
+				Record: core.NativeCheckpointForkRecord{
+					Kind:           core.CheckpointKindAWSAMI,
+					ImageID:        "ami-12345678",
+					AccessMetadata: test.metadata,
+				},
+			})
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("error=%v, want %q", err, test.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.AWSSSHTransport != test.want {
+				t.Fatalf("aws.sshTransport=%q, want %q", cfg.AWSSSHTransport, test.want)
+			}
+		})
+	}
+}

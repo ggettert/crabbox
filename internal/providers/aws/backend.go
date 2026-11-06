@@ -24,6 +24,7 @@ type awsClient interface {
 	CreateServerWithFallback(context.Context, core.Config, string, string, string, bool, func(string, ...any)) (core.Server, core.Config, error)
 	CreateServerWithFallbackControl(context.Context, core.Config, string, string, string, bool, func(string, ...any), *core.AWSFixedCreateControl) (core.Server, core.Config, error)
 	WaitForServerIP(context.Context, string) (core.Server, error)
+	WaitForServerVisible(context.Context, string) (core.Server, error)
 	CheckAcquireState(context.Context, string) error
 	GetServer(context.Context, string) (core.Server, error)
 	DeleteServer(context.Context, string) error
@@ -44,7 +45,17 @@ func (b *awsLeaseBackend) SupportsRequestedLeaseID() bool { return true }
 
 func (b *awsLeaseBackend) SupportsRequestedCheckpointID() bool { return true }
 
+func (b *awsLeaseBackend) ValidateCoordinatorAcquire() error {
+	if core.AWSSSHTransportForConfig(b.Cfg) == core.AWSSSHTransportSSM {
+		return core.Exit(2, "provider=aws aws.sshTransport=ssm requires direct mode; credentialless coordinator leases cannot grant the local AWS CLI an SSM session")
+	}
+	return nil
+}
+
 func (b *awsLeaseBackend) Acquire(ctx context.Context, req core.AcquireRequest) (core.LeaseTarget, error) {
+	if err := preflightAWSSSMTransport(b.Cfg); err != nil {
+		return core.LeaseTarget{}, err
+	}
 	if strings.TrimSpace(req.RequestedLeaseID) != "" {
 		return b.acquireFixed(ctx, req)
 	}
@@ -77,7 +88,9 @@ func (b *awsLeaseBackend) acquireOnce(ctx context.Context, keep bool, requestedS
 	}
 	cfg.SSHKey = keyPath
 	cfg.ProviderKey = core.ProviderKeyForLease(leaseID)
-	ensureAWSSSHCIDRs(ctx, &cfg)
+	if core.AWSSSHTransportForConfig(cfg) != core.AWSSSHTransportSSM {
+		ensureAWSSSHCIDRs(ctx, &cfg)
+	}
 	fmt.Fprintf(b.RT.Stderr, "provisioning provider=aws lease=%s slug=%s class=%s preferred_type=%s region=%s keep=%v market=%s strategy=%s\n", leaseID, slug, cfg.Class, cfg.ServerType, cfg.AWSRegion, keep, cfg.Capacity.Market, cfg.Capacity.Strategy)
 	server, resolvedCfg, err := client.CreateServerWithFallback(ctx, cfg, publicKey, leaseID, slug, keep, func(format string, args ...any) {
 		fmt.Fprintf(b.RT.Stderr, format, args...)
@@ -85,6 +98,7 @@ func (b *awsLeaseBackend) acquireOnce(ctx context.Context, keep bool, requestedS
 	if err != nil {
 		return core.LeaseTarget{}, err
 	}
+	server = annotateAWSSSHTransport(server, cfg)
 	cfg = resolvedCfg
 	rollback := true
 	rollbackCloudID := server.CloudID
@@ -105,10 +119,15 @@ func (b *awsLeaseBackend) acquireOnce(ctx context.Context, keep bool, requestedS
 		return core.LeaseTarget{}, err
 	}
 	fmt.Fprintf(b.RT.Stderr, "provisioned lease=%s server=%s type=%s\n", leaseID, server.DisplayID(), cfg.ServerType)
-	server, err = client.WaitForServerIP(ctx, server.CloudID)
+	if core.AWSSSHTransportForConfig(cfg) != core.AWSSSHTransportSSM {
+		server, err = client.WaitForServerIP(ctx, server.CloudID)
+	} else {
+		server, err = client.WaitForServerVisible(ctx, server.CloudID)
+	}
 	if err != nil {
 		return core.LeaseTarget{}, err
 	}
+	server = annotateAWSSSHTransport(server, cfg)
 	if err := validateResourceConstrainedAWSServer(cfg, server); err != nil {
 		return core.LeaseTarget{}, err
 	}
@@ -124,7 +143,10 @@ func (b *awsLeaseBackend) acquireOnce(ctx context.Context, keep bool, requestedS
 	if cfg.Network == core.NetworkTailscale && cfg.Tailscale.Enabled && strings.TrimSpace(cfg.Tailscale.Hostname) == "" {
 		cfg.Tailscale.Hostname = core.RenderTailscaleHostname(cfg.Tailscale.HostnameTemplate, leaseID, slug, cfg.Provider)
 	}
-	target := sshTargetForBootstrap(cfg, server.PublicNet.IPv4.IP, leaseID, slug)
+	target, err := sshTargetForBootstrap(cfg, server, leaseID, slug, false)
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
 	if err := waitAWSAcquireReady(ctx, func(ctx context.Context) error {
 		return client.CheckAcquireState(ctx, server.CloudID)
 	}, func(ctx context.Context) error {
@@ -195,7 +217,9 @@ func (b *awsLeaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequ
 			return core.FixedLeaseBinding{}, err
 		}
 		cfg.AWSSSHCIDRsPinned = len(cfg.AWSSSHCIDRs) > 0
-		ensureAWSSSHCIDRs(ctx, &cfg)
+		if core.AWSSSHTransportForConfig(cfg) != core.AWSSSHTransportSSM {
+			ensureAWSSSHCIDRs(ctx, &cfg)
+		}
 		requestedSlug := core.NormalizeLeaseSlug(req.RequestedSlug)
 		intentRequest := core.FixedAWSCreateIntentRequest{
 			AccountID: accountID, RequestedSlug: requestedSlug, SSHPublicKey: publicKey, Keep: req.Keep,
@@ -290,6 +314,7 @@ func (b *awsLeaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequ
 				return core.Server{}, err
 			}
 			resolvedCfg = next
+			server = annotateAWSSSHTransport(server, resolvedCfg)
 			return annotateAWSServerRegion(server, resolvedCfg.AWSRegion), nil
 		}, PrepareAccess: func(ctx context.Context, tx *core.FixedTransaction, server core.Server) (core.LeaseTarget, error) {
 			claim, intent := tx.Claim, tx.Claim.FixedCreateIntent
@@ -314,10 +339,15 @@ func (b *awsLeaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequ
 			if err != nil {
 				return core.LeaseTarget{}, err
 			}
-			server, err = serverClient.WaitForServerIP(ctx, server.CloudID)
+			if core.AWSSSHTransportForConfig(resolvedCfg) != core.AWSSSHTransportSSM {
+				server, err = serverClient.WaitForServerIP(ctx, server.CloudID)
+			} else {
+				server, err = serverClient.WaitForServerVisible(ctx, server.CloudID)
+			}
 			if err != nil {
 				return core.LeaseTarget{}, err
 			}
+			server = annotateAWSSSHTransport(server, resolvedCfg)
 			server = annotateAWSServerRegion(server, resolvedCfg.AWSRegion)
 			if err := validateExactAWSClaim(server, leaseID, *claim); err != nil {
 				return core.LeaseTarget{}, err
@@ -328,7 +358,10 @@ func (b *awsLeaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequ
 			if err := validateFixedAWSAttemptServer(server, leaseID, *pinned); err != nil {
 				return core.LeaseTarget{}, err
 			}
-			target := sshTargetForBootstrap(resolvedCfg, server.PublicNet.IPv4.IP, leaseID, intent.Slug)
+			target, err := sshTargetForBootstrap(resolvedCfg, server, leaseID, intent.Slug, false)
+			if err != nil {
+				return core.LeaseTarget{}, err
+			}
 			if err := waitAWSAcquireReady(ctx, func(ctx context.Context) error {
 				return serverClient.CheckAcquireState(ctx, server.CloudID)
 			}, func(ctx context.Context) error {
@@ -444,7 +477,10 @@ func (b *awsLeaseBackend) Resolve(ctx context.Context, req core.ResolveRequest) 
 				return core.LeaseTarget{}, core.Exit(4, "lease/server not found: %s (instance exists but is not Crabbox-managed)", req.ID)
 			}
 			leaseID := core.Blank(server.Labels["lease"], req.ID)
-			target := core.SSHTargetFromConfig(cfg, server.PublicNet.IPv4.IP)
+			target, err := sshTargetForAWSServer(cfg, server, server.PublicNet.IPv4.IP, req.ReleaseOnly)
+			if err != nil {
+				return core.LeaseTarget{}, err
+			}
 			return b.ResolvedLeaseTarget(server, target, leaseID, req.ReleaseOnly)
 		}
 		if lastErr != nil {
@@ -468,7 +504,10 @@ func (b *awsLeaseBackend) Resolve(ctx context.Context, req core.ResolveRequest) 
 		return core.LeaseTarget{}, err
 	} else if leaseID != "" {
 		cfg := awsConfigForServer(b.Cfg, server)
-		target := core.SSHTargetFromConfig(cfg, server.PublicNet.IPv4.IP)
+		target, err := sshTargetForAWSServer(cfg, server, server.PublicNet.IPv4.IP, req.ReleaseOnly)
+		if err != nil {
+			return core.LeaseTarget{}, err
+		}
 		return b.ResolvedLeaseTarget(server, target, leaseID, req.ReleaseOnly)
 	}
 	return core.LeaseTarget{}, core.Exit(4, "lease/server not found: %s", req.ID)
@@ -479,11 +518,40 @@ func (b *awsLeaseBackend) ResolveRunLeaseUnderClaim(ctx context.Context, req cor
 	// direct resolver without inventory discovery or cross-region fallback.
 	bound := *b
 	bound.Cfg = awsConfigForServer(b.Cfg, core.Server{Labels: original.Labels})
+	claimTransport := strings.TrimSpace(original.Labels["aws_ssh_transport"])
+	if claimTransport != "" {
+		normalized, err := core.NormalizeAWSSSHTransport(claimTransport)
+		if err != nil {
+			return core.LeaseTarget{}, core.Exit(4, "AWS claim for instance %s has invalid persisted SSH transport %q", original.CloudID, claimTransport)
+		}
+		bound.Cfg.AWSSSHTransport = normalized
+	}
 	bound.Cfg.Capacity.Regions = nil
 	req.ID = original.CloudID
 	lease, err := bound.Resolve(ctx, req)
 	if err != nil {
 		return core.LeaseTarget{}, err
+	}
+	if claimTransport != "" {
+		liveTransport := strings.TrimSpace(lease.Server.Labels["aws_ssh_transport"])
+		if liveTransport != "" {
+			normalized, err := core.NormalizeAWSSSHTransport(liveTransport)
+			if err != nil {
+				return core.LeaseTarget{}, core.Exit(4, "AWS instance %s has invalid persisted SSH transport %q", lease.Server.DisplayID(), liveTransport)
+			}
+			if normalized != bound.Cfg.AWSSSHTransport {
+				return core.LeaseTarget{}, core.Exit(4, "AWS instance %s SSH transport conflicts with its durable claim", lease.Server.DisplayID())
+			}
+		} else {
+			if lease.Server.Labels == nil {
+				lease.Server.Labels = map[string]string{}
+			}
+			lease.Server.Labels["aws_ssh_transport"] = bound.Cfg.AWSSSHTransport
+			lease.SSH, err = sshTargetForAWSServer(bound.Cfg, lease.Server, lease.Server.PublicNet.IPv4.IP, req.ReleaseOnly)
+			if err != nil {
+				return core.LeaseTarget{}, err
+			}
+		}
 	}
 	// Fixed leases retain their acquired/account fence. Ordinary run admission
 	// uses the endpoint policy, which preserves absent historical cleanup identity.
@@ -820,8 +888,8 @@ func bootstrapSSHHost(cfg core.Config, publicIP, leaseID, slug string) string {
 	return hostname
 }
 
-func sshTargetForBootstrap(cfg core.Config, publicIP, leaseID, slug string) core.SSHTarget {
-	return core.SSHTargetFromConfig(cfg, bootstrapSSHHost(cfg, publicIP, leaseID, slug))
+func sshTargetForBootstrap(cfg core.Config, server core.Server, leaseID, slug string, releaseOnly bool) (core.SSHTarget, error) {
+	return sshTargetForAWSServer(cfg, server, bootstrapSSHHost(cfg, server.PublicNet.IPv4.IP, leaseID, slug), releaseOnly)
 }
 
 var bootstrapAWSWindowsDesktop = core.BootstrapAWSWindowsDesktop

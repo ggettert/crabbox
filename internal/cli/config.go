@@ -80,6 +80,7 @@ type Config struct {
 	Image                         string
 	imageExplicit                 bool
 	AWSRegion                     string
+	AWSSSHTransport               string
 	AWSStockImage                 bool
 	AWSAMI                        string
 	AWSSnapshot                   string
@@ -1928,6 +1929,7 @@ type fileHetznerConfig struct {
 
 type fileAWSConfig struct {
 	Region          string   `yaml:"region,omitempty"`
+	SSHTransport    string   `yaml:"sshTransport,omitempty"`
 	AMI             string   `yaml:"ami,omitempty"`
 	StockImage      *bool    `yaml:"stockImage,omitempty"`
 	SecurityGroupID string   `yaml:"securityGroupId,omitempty"`
@@ -2810,6 +2812,7 @@ func applyFileConfigWithTrustAndProviderSource(cfg *Config, file fileConfig, tru
 			cfg.AWSStockImage = *file.AWS.StockImage
 			recordConfigInput(cfg, "aws", inputSource, true)
 		}
+		configInputFileString(cfg, "aws", inputSource, &cfg.AWSSSHTransport, file.AWS.SSHTransport)
 		configInputFileString(cfg, "aws", inputSource, &cfg.AWSAMI, file.AWS.AMI)
 		configInputFileString(cfg, "aws", inputSource, &cfg.AWSSGID, file.AWS.SecurityGroupID)
 		configInputFileString(cfg, "aws", inputSource, &cfg.AWSSubnetID, file.AWS.SubnetID)
@@ -4170,6 +4173,7 @@ func applyEnv(cfg *Config) error {
 		recordConfigInput(cfg, "aws", configInputEnvironment, true)
 	}
 	cfg.AWSAMI = configInputEnvString(cfg, "aws", cfg.AWSAMI, "CRABBOX_AWS_AMI")
+	cfg.AWSSSHTransport = configInputEnvString(cfg, "aws", cfg.AWSSSHTransport, "CRABBOX_AWS_SSH_TRANSPORT")
 	cfg.AWSSGID = configInputEnvString(cfg, "aws", cfg.AWSSGID, "CRABBOX_AWS_SECURITY_GROUP_ID")
 	cfg.AWSSubnetID = configInputEnvString(cfg, "aws", cfg.AWSSubnetID, "CRABBOX_AWS_SUBNET_ID")
 	cfg.AWSProfile = configInputEnvString(cfg, "aws", cfg.AWSProfile, "CRABBOX_AWS_INSTANCE_PROFILE")

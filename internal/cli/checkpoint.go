@@ -90,6 +90,7 @@ type checkpointRecord struct {
 		Direct           bool              `json:"direct,omitempty"`
 		Strategy         string            `json:"strategy,omitempty"`
 		NoReboot         bool              `json:"noReboot,omitempty"`
+		AccessMetadata   map[string]string `json:"accessMetadata,omitempty"`
 		Metadata         map[string]string `json:"metadata,omitempty"`
 	} `json:"native,omitempty"`
 	Repo struct {
@@ -2812,6 +2813,7 @@ func newCheckpointRecord(repo Repo, cfg Config, server Server, target SSHTarget,
 	record.Repo.RemoteURL = repo.RemoteURL
 	record.Repo.Head = repo.Head
 	record.Repo.BaseRef = repo.BaseRef
+	record.Native.AccessMetadata = copyStringMap(target.AccessMetadata)
 	return record, dir, nil
 }
 

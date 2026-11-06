@@ -14,10 +14,15 @@ Windows, Windows under WSL2, and EC2 Mac. AWS is one of the five providers that
 can run through the coordinator (alongside Azure, Daytona, GCP, and Hetzner);
 without a broker URL configured it runs direct-from-CLI against the EC2 API.
 
+Direct Linux leases can explicitly set `aws.sshTransport: ssm` to tunnel that
+same SSH workflow through AWS Systems Manager Session Manager. This is still
+SSH: the per-lease key, guest `sshd`, host-key trust, sync, interactive terminal,
+SFTP/copy, rsync, tunnels, checkpoints, reuse, and cleanup semantics are unchanged.
+
 A separate [private AWS workspace service](../features/aws-private-workspaces.md)
-uses the Node/PostgreSQL coordinator, an exact small-instance allowlist, and SSM
-instead of SSH. It is an API-managed deployment shape, not another CLI machine
-class.
+uses the Node/PostgreSQL coordinator, an exact small-instance allowlist, and
+SSM Run Command instead of SSH. It is an API-managed deployment shape, not
+another CLI machine class or this SSH-over-Session-Manager transport.
 
 ## When to use AWS
 
@@ -366,6 +371,7 @@ class: beast
 market: spot
 aws:
   region: eu-west-1        # default eu-west-1
+  sshTransport: direct     # direct (default) or ssm for direct Linux leases
   ami: ""                  # override the auto-selected AMI
   securityGroupId: ""      # reuse an existing security group
   subnetId: ""             # pin a subnet (and its VPC)
@@ -374,6 +380,60 @@ aws:
   sshCIDRs: []             # allowed SSH source ranges
   macHostId: ""            # pin an EC2 Mac Dedicated Host
 ```
+
+### SSH over Session Manager
+
+Set `aws.sshTransport: ssm` or `CRABBOX_AWS_SSH_TRANSPORT=ssm` for a direct
+Linux EC2 lease that must not require a public IP or inbound SSH rule. Crabbox
+keeps the ordinary SSH key and `sshd`, but gives OpenSSH a provider-owned
+`ProxyCommand` equivalent to:
+
+```sh
+aws ssm start-session \
+  --target i-0123456789abcdef0 \
+  --document-name AWS-StartSSHSession \
+  --parameters portNumber=22 \
+  --region eu-west-1
+```
+
+The real command is bound to the lease's instance ID, persisted region, and
+selected SSH port. Values are shell-quoted, credentials are inherited through
+the process environment, and no credential is written to the command line,
+lease metadata, or logs. `aws.instanceProfile` / `CRABBOX_AWS_INSTANCE_PROFILE`
+is the EC2 instance profile attached to the guest; it is **not** an AWS CLI
+profile and Crabbox never passes it as `--profile`.
+
+Prerequisites:
+
+- direct mode; coordinator/brokered SSM SSH is rejected before allocation
+  because coordinator credentials do not grant the caller's local proxy;
+- a Linux EC2 AMI with `sshd` and SSM Agent installed and running (Amazon Linux
+  2023 is the initial supported deployment); Windows and macOS SSM SSH are not
+  implemented;
+- a Linux or macOS local client; local Windows ProxyCommand quoting is not yet
+  supported and is rejected before allocation;
+- `aws` and `session-manager-plugin` on the local `PATH`;
+- caller credentials accepted by both the AWS SDK default chain and AWS CLI,
+  with `ssm:StartSession` access to the instance and `AWS-StartSSHSession`;
+- instance registration through either a configured instance profile or
+  Default Host Management Configuration, plus network egress or VPC endpoints
+  needed by SSM Agent. Crabbox does not create IAM roles or enable DHMC.
+
+SSM mode creates or selects a distinct `crabbox-runners-ssm` default security
+group and does not add, prune, or authorize SSH ingress. A configured
+`aws.securityGroupId` remains operator-owned and is attached without mutation.
+The primary network interface explicitly disables public-IP association, and
+Crabbox skips public-IP discovery and waiting. Other requested application
+ports and network configuration retain their existing behavior.
+
+If the AWS CLI, Session Manager plugin, target registration, IAM permission, or
+network path is unavailable, acquisition fails instead of falling back to
+direct SSH. The AWS CLI and plugin report session/authentication diagnostics on
+the SSH connection. Closing SSH terminates its local proxy/plugin process;
+connection loss does not release a retained lease, and normal explicit release
+still terminates only the exact lease-owned EC2 instance and key registration.
+Session Manager audit events identify session lifecycle, but AWS does not log
+the contents of SSH sessions tunneled through Session Manager.
 
 Root volumes default to 40 GB (`tiny`), 80 GB (`small`), 150 GB (`standard`
 and `fast`), 250 GB (`large`), or 400 GB (`beast`). An unset or zero `aws.rootGB`
@@ -444,6 +504,7 @@ AWS_SECRET_ACCESS_KEY
 AWS_SESSION_TOKEN
 AWS_REGION
 CRABBOX_AWS_REGION                  # overrides AWS_REGION / aws.region
+CRABBOX_AWS_SSH_TRANSPORT           # direct (default) or ssm; direct Linux only
 CRABBOX_AWS_AMI
 CRABBOX_AWS_STOCK_IMAGE             # aws.stockImage; brokered AWS, admin-only
 CRABBOX_AWS_SECURITY_GROUP_ID
@@ -586,7 +647,8 @@ timeout budgets are unchanged.
 3. Launch the EC2 instance — Spot request, On-Demand instance, native Windows
    instance, or EC2 Mac host-backed instance.
 4. Tag the instance, volumes, and Spot requests with Crabbox lease labels.
-5. Wait for SSH readiness, plus the `crabbox-ready` marker on POSIX targets.
+5. Wait for direct SSH readiness, or for SSH through Session Manager when
+   `aws.sshTransport: ssm`, plus the `crabbox-ready` marker on POSIX targets.
 6. Hand off to core for sync and command execution over SSH.
 7. Terminate on release, cleanup, or broker expiry.
 

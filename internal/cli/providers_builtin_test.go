@@ -551,6 +551,11 @@ func (testAWSProvider) NativeCheckpointCapability(req NativeCheckpointRequest) (
 	return NativeCheckpointCapability{Kind: checkpointKindAWSEBS}, true
 }
 func (testAWSProvider) ApplyNativeCheckpointForkConfig(req NativeCheckpointForkRequest) error {
+	transport, err := NormalizeAWSSSHTransport(req.Record.AccessMetadata["aws.sshTransport"])
+	if err != nil {
+		return Exit(2, "AWS checkpoint has invalid persisted SSH transport: %v", err)
+	}
+	req.Config.AWSSSHTransport = transport
 	switch req.Record.Kind {
 	case checkpointKindAWSAMI:
 		req.Config.AWSAMI = req.Record.ImageID

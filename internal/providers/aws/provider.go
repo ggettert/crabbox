@@ -53,7 +53,7 @@ var classProfiles = buildClassProfiles()
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
 		Authentication: core.ProviderAuthentication{
-			{Route: "direct", Methods: []core.ProviderAuthenticationMethod{core.ProviderAuthenticationSDKCredentials}, Description: "Direct access uses the AWS SDK credential chain."},
+			{Route: "direct", Methods: []core.ProviderAuthenticationMethod{core.ProviderAuthenticationSDKCredentials}, Description: "Direct access uses the AWS SDK credential chain; optional SSH-over-SSM also requires the AWS CLI to resolve the same caller credentials."},
 			{Route: "brokered", Methods: []core.ProviderAuthenticationMethod{core.ProviderAuthenticationCoordinator}, Description: "The client authenticates to the coordinator; cloud credentials remain server-side."},
 		},
 		Name:   "aws",
@@ -73,6 +73,10 @@ func (Provider) Spec() core.ProviderSpec {
 func (Provider) RegisterFlags(*flag.FlagSet, core.Config) any { return core.NoProviderFlags() }
 func (Provider) ApplyFlags(*core.Config, *flag.FlagSet, any) error {
 	return nil
+}
+
+func (Provider) ValidateConfig(cfg core.Config) error {
+	return validateAWSSSHTransportConfig(cfg)
 }
 
 func (Provider) ConfigureSSHTarget(target *core.SSHTarget, readyCommand string) {
@@ -106,7 +110,7 @@ func (Provider) PrepareLeaseClaimEndpoint(existing core.LeaseClaim, provider, sl
 	if existing.CloudID != "" && server.CloudID != "" && existing.CloudID != server.CloudID {
 		return core.Server{}, core.Exit(2, "refusing to rewrite AWS lease=%s with stale instance identity", existing.LeaseID)
 	}
-	labels, conflict := shared.PreserveClaimIdentityLabels(server.Labels, existing.Labels, "aws_key_pair_id", "aws_account_id")
+	labels, conflict := shared.PreserveClaimIdentityLabels(server.Labels, existing.Labels, "aws_key_pair_id", "aws_account_id", "aws_ssh_transport")
 	if conflict != "" {
 		return core.Server{}, core.Exit(2, "refusing to rewrite AWS lease=%s with mismatched %s", existing.LeaseID, conflict)
 	}
@@ -293,6 +297,9 @@ func awsMacOSInstanceTypeCandidates() []string {
 }
 
 func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
+	if err := p.ValidateConfig(cfg); err != nil {
+		return nil, err
+	}
 	if cfg.AWSStockImage && !core.ShouldUseCoordinator(cfg, p.Spec()) {
 		return nil, core.Exit(2, "aws.stockImage requires brokered AWS leases")
 	}
@@ -336,6 +343,11 @@ func isWindowsNativeTarget(req core.NativeCheckpointRequest) bool {
 
 func (Provider) ApplyNativeCheckpointForkConfig(req core.NativeCheckpointForkRequest) error {
 	cfg := req.Config
+	transport, err := core.NormalizeAWSSSHTransport(req.Record.AccessMetadata[awsCheckpointSSHTransportMetadata])
+	if err != nil {
+		return core.Exit(2, "AWS checkpoint has invalid persisted SSH transport: %v", err)
+	}
+	cfg.AWSSSHTransport = transport
 	switch req.Record.Kind {
 	case core.CheckpointKindAWSAMI:
 		cfg.AWSAMI = req.Record.ImageID

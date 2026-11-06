@@ -13,6 +13,7 @@ func (Provider) ConfigShowSection(cfg core.Config) core.ProviderConfigShowSectio
 		JSONKey: "aws", TextLabel: "aws", Providers: []string{"aws"},
 		Fields: []core.ProviderConfigShowField{
 			{JSONName: "region", JSONValue: cfg.AWSRegion, TextName: "region", TextValue: cfg.AWSRegion},
+			{JSONName: "sshTransport", JSONValue: core.AWSSSHTransportForConfig(cfg), TextName: "ssh_transport", TextValue: core.AWSSSHTransportForConfig(cfg)},
 			{JSONName: "ami", JSONValue: cfg.AWSAMI},
 			{JSONName: "stockImage", JSONValue: cfg.AWSStockImage},
 			{JSONName: "securityGroupId", JSONValue: cfg.AWSSGID},

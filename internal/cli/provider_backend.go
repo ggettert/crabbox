@@ -753,21 +753,22 @@ type NativeCheckpointLifecycleProvider interface {
 }
 
 type NativeCheckpointForkRecord struct {
-	ArtifactDir  string
-	Kind         string
-	ImageID      string
-	Name         string
-	Resource     string
-	Region       string
-	Project      string
-	Direct       bool
-	HostID       string
-	TargetOS     string
-	WindowsMode  string
-	Desktop      bool
-	ServerType   string
-	Architecture string
-	Metadata     map[string]string
+	ArtifactDir    string
+	Kind           string
+	ImageID        string
+	Name           string
+	Resource       string
+	Region         string
+	Project        string
+	Direct         bool
+	HostID         string
+	TargetOS       string
+	WindowsMode    string
+	Desktop        bool
+	ServerType     string
+	Architecture   string
+	AccessMetadata map[string]string
+	Metadata       map[string]string
 }
 
 type NativeCheckpointForkRequest struct {

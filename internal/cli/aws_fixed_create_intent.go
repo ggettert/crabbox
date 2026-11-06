@@ -59,6 +59,7 @@ type fixedAWSCreateIntentNetwork struct {
 
 // fixedAWSCreateIntentSSH stays separate because its identity fields must not enter Machine0's durable JSON.
 type fixedAWSCreateIntentSSH struct {
+	Transport       string   `json:"transport,omitempty" configFields:"AWSSSHTransport"`
 	User            string   `json:"user" configFields:"SSHUser"`
 	Port            string   `json:"port" configFields:"SSHPort"`
 	FallbackPorts   []string `json:"fallbackPorts,omitempty" configFields:"SSHFallbackPorts"`
@@ -127,6 +128,10 @@ func fixedAWSCreateIntentForConfig(cfg Config, req FixedAWSCreateIntentRequest) 
 	if cfg.AWSSSHCIDRsPinned {
 		sshCIDRs = fixedCanonicalStringSet(cfg.AWSSSHCIDRs)
 	}
+	sshTransport := ""
+	if awsUsesSSMSSHTransport(cfg) {
+		sshTransport = AWSSSHTransportSSM
+	}
 	return fixedAWSCreateIntent{
 		Version:       FixedAWSCreateIntentVersion,
 		AccountID:     strings.TrimSpace(req.AccountID),
@@ -162,6 +167,7 @@ func fixedAWSCreateIntentForConfig(cfg Config, req FixedAWSCreateIntentRequest) 
 			SSHCIDRsPinned:  cfg.AWSSSHCIDRsPinned,
 			SSHCIDRs:        sshCIDRs,
 			SSH: fixedAWSCreateIntentSSH{
+				Transport:       sshTransport,
 				User:            strings.TrimSpace(cfg.SSHUser),
 				Port:            strings.TrimSpace(cfg.SSHPort),
 				FallbackPorts:   fixedCanonicalOrderedStrings(cfg.SSHFallbackPorts),

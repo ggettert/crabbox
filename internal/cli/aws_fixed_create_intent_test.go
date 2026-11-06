@@ -170,6 +170,32 @@ func TestFixedAWSCreateIntentExcludesSecrets(t *testing.T) {
 	}
 }
 
+func TestFixedAWSCreateIntentBindsSSMTransportWithoutChangingDirectDefault(t *testing.T) {
+	cfg := BaseConfig()
+	cfg.Provider = "aws"
+	cfg.TargetOS = TargetLinux
+	req := FixedAWSCreateIntentRequest{AccountID: "123456789012", RequestedSlug: "transport", SSHPublicKey: "ssh-ed25519 fixture"}
+	direct, err := FixedAWSCreateIntentFingerprint(cfg, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	explicitDirect := cfg
+	explicitDirect.AWSSSHTransport = AWSSSHTransportDirect
+	same, err := FixedAWSCreateIntentFingerprint(explicitDirect, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ssm := cfg
+	ssm.AWSSSHTransport = AWSSSHTransportSSM
+	different, err := FixedAWSCreateIntentFingerprint(ssm, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if direct != same || direct == different {
+		t.Fatalf("direct=%s explicit=%s ssm=%s", direct, same, different)
+	}
+}
+
 func TestFixedAWSCreateIntentWarmupKeepDefaultDoesNotOverrideRequest(t *testing.T) {
 	cfg := BaseConfig()
 	cfg.Provider = "aws"

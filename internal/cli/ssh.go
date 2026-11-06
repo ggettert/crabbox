@@ -68,7 +68,10 @@ type SSHTarget struct {
 	SSHConfigFile           string // Provider-owned IdentitiesOnly route; bypass ambient SSH config.
 	SSHConfigData           []byte `json:"-"` // Captured provider config; keep resolution and transport on the same bytes.
 	ProxyCommand            string
-	ChildEnvDenylist        []string
+	// AccessMetadata carries non-secret provider access identity into durable
+	// checkpoint records so forks can preserve the source transport.
+	AccessMetadata   map[string]string
+	ChildEnvDenylist []string
 	// Transport-only overrides can contain credentials; never serialize them.
 	ChildEnv          map[string]string `json:"-"`
 	DiagnosticSecrets []string          `json:"-"` // Provider credentials echoed by local authentication hooks.
