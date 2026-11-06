@@ -53,7 +53,7 @@ var classProfiles = buildClassProfiles()
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
 		Authentication: core.ProviderAuthentication{
-			{Route: "direct", Methods: []core.ProviderAuthenticationMethod{core.ProviderAuthenticationSDKCredentials}, Description: "Direct access uses the AWS SDK credential chain; optional SSH-over-SSM also requires the AWS CLI to resolve the same caller credentials."},
+			{Route: "direct", Methods: []core.ProviderAuthenticationMethod{core.ProviderAuthenticationSDKCredentials}, Description: "Direct access and optional SSH-over-SSM use the AWS SDK default credential chain."},
 			{Route: "brokered", Methods: []core.ProviderAuthenticationMethod{core.ProviderAuthenticationCoordinator}, Description: "The client authenticates to the coordinator; cloud credentials remain server-side."},
 		},
 		Name:   "aws",

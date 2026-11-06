@@ -2,6 +2,7 @@ package aws
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 var awsSSMLookPath = exec.LookPath
 var awsSSMRuntimeGOOS = runtime.GOOS
+var awsSSMExecutable = os.Executable
 
 const awsCheckpointSSHTransportMetadata = "aws.sshTransport"
 
@@ -36,10 +38,8 @@ func preflightAWSSSMTransport(cfg core.Config) error {
 	if awsSSMRuntimeGOOS == "windows" {
 		return core.Exit(2, "provider=aws aws.sshTransport=ssm does not yet support a local Windows SSH client")
 	}
-	for _, dependency := range []string{"aws", "session-manager-plugin"} {
-		if _, err := awsSSMLookPath(dependency); err != nil {
-			return core.Exit(3, "provider=aws aws.sshTransport=ssm requires %s on PATH: %v", dependency, err)
-		}
+	if _, err := awsSSMLookPath("session-manager-plugin"); err != nil {
+		return core.Exit(3, "provider=aws aws.sshTransport=ssm requires session-manager-plugin on PATH: %v", err)
 	}
 	return nil
 }
@@ -66,19 +66,19 @@ func annotateAWSSSHTransport(server core.Server, cfg core.Config) core.Server {
 	return server
 }
 
-func awsSSMProxyCommand(awsCLI, instanceID, region string) string {
+func awsSSMProxyCommand(executable, plugin, instanceID, region string) string {
 	literalArgs := []string{
-		awsCLI, "ssm", "start-session",
+		executable, "__aws-ssm-proxy",
 		"--target", instanceID,
-		"--document-name", "AWS-StartSSHSession",
-		"--parameters",
+		"--region", region,
+		"--port",
 	}
 	quoted := make([]string, 0, len(literalArgs)+3)
 	for _, arg := range literalArgs {
 		quoted = append(quoted, shared.QuoteSSHProxyCommandWord(arg))
 	}
-	quoted = append(quoted, shared.QuoteSSHProxyCommandWord("portNumber=")+"%p")
-	quoted = append(quoted, shared.QuoteSSHProxyCommandWord("--region"), shared.QuoteSSHProxyCommandWord(region))
+	quoted = append(quoted, "%p")
+	quoted = append(quoted, shared.QuoteSSHProxyCommandWord("--plugin"), shared.QuoteSSHProxyCommandWord(plugin))
 	return strings.Join(quoted, " ")
 }
 
@@ -113,10 +113,16 @@ func sshTargetForAWSServer(cfg core.Config, server core.Server, directHost strin
 	if err := preflightAWSSSMTransport(ssmCfg); err != nil {
 		return core.SSHTarget{}, err
 	}
-	awsCLI, err := awsSSMLookPath("aws")
+	executable, err := awsSSMExecutable()
 	if err != nil {
-		return core.SSHTarget{}, fmt.Errorf("resolve AWS CLI for SSM SSH transport: %w", err)
+		return core.SSHTarget{}, fmt.Errorf("resolve Crabbox executable for SSM SSH transport: %w", err)
 	}
-	target.ProxyCommand = awsSSMProxyCommand(awsCLI, instanceID, region)
+	plugin, err := awsSSMLookPath("session-manager-plugin")
+	if err != nil {
+		return core.SSHTarget{}, fmt.Errorf("resolve Session Manager plugin for SSM SSH transport: %w", err)
+	}
+	target.ProxyCommand = awsSSMProxyCommand(executable, plugin, instanceID, region)
+	target.ProxyCommandStatus = true
+	target.NoControlMaster = true
 	return target, nil
 }

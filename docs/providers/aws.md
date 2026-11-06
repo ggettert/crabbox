@@ -385,8 +385,8 @@ aws:
 
 Set `aws.sshTransport: ssm` or `CRABBOX_AWS_SSH_TRANSPORT=ssm` for a direct
 Linux EC2 lease that must not require a public IP or inbound SSH rule. Crabbox
-keeps the ordinary SSH key and `sshd`, but gives OpenSSH a provider-owned
-`ProxyCommand` equivalent to:
+keeps the ordinary SSH key and `sshd`, but gives OpenSSH a provider-owned,
+internal `ProxyCommand` equivalent to starting this SDK request:
 
 ```sh
 aws ssm start-session \
@@ -396,12 +396,19 @@ aws ssm start-session \
   --region eu-west-1
 ```
 
-The real command is bound to the lease's instance ID, persisted region, and
-selected SSH port. Values are shell-quoted, credentials are inherited through
-the process environment, and no credential is written to the command line,
-lease metadata, or logs. `aws.instanceProfile` / `CRABBOX_AWS_INSTANCE_PROFILE`
-is the EC2 instance profile attached to the guest; it is **not** an AWS CLI
-profile and Crabbox never passes it as `--profile`.
+The real helper is bound to the lease's instance ID, persisted region, selected
+SSH port, and absolute Session Manager plugin path. It calls `StartSession`
+through the AWS SDK default credential chain, streams the plugin protocol to
+OpenSSH, and owns the returned session ID immediately. On normal EOF, plugin
+failure, startup failure after allocation, or cancellation, it calls
+`TerminateSession` for that exact ID with a short cleanup context independent
+of caller cancellation. SSM SSH disables OpenSSH connection multiplexing so each
+command has one helper, one owned session, and one command-scoped cleanup result;
+direct SSH and other providers keep their existing multiplexing behavior. Values
+are shell-quoted, and response tokens and stream URLs are neither logged nor
+persisted. `aws.instanceProfile` /
+`CRABBOX_AWS_INSTANCE_PROFILE` is the EC2 instance profile attached to the
+guest; it is **not** a local SDK profile.
 
 Prerequisites:
 
@@ -412,8 +419,9 @@ Prerequisites:
   implemented;
 - a Linux or macOS local client; local Windows ProxyCommand quoting is not yet
   supported and is rejected before allocation;
-- `aws` and `session-manager-plugin` on the local `PATH`;
-- caller credentials accepted by both the AWS SDK default chain and AWS CLI,
+- `session-manager-plugin` on the local `PATH` (the AWS CLI is not required for
+  this transport);
+- caller credentials accepted by the AWS SDK default chain,
   with `ssm:StartSession` access to the instance and `AWS-StartSSHSession`;
 - instance registration through either a configured instance profile or
   Default Host Management Configuration, plus network egress or VPC endpoints
@@ -426,14 +434,20 @@ The primary network interface explicitly disables public-IP association, and
 Crabbox skips public-IP discovery and waiting. Other requested application
 ports and network configuration retain their existing behavior.
 
-If the AWS CLI, Session Manager plugin, target registration, IAM permission, or
-network path is unavailable, acquisition fails instead of falling back to
-direct SSH. The AWS CLI and plugin report session/authentication diagnostics on
-the SSH connection. Closing SSH terminates its local proxy/plugin process;
-connection loss does not release a retained lease, and normal explicit release
-still terminates only the exact lease-owned EC2 instance and key registration.
-Session Manager audit events identify session lifecycle, but AWS does not log
-the contents of SSH sessions tunneled through Session Manager.
+If the SDK credential chain, Session Manager plugin, target registration, IAM
+permission, or network path is unavailable, acquisition fails instead of
+falling back to direct SSH. Cleanup failure is command-fatal even when OpenSSH
+has already returned success: the helper reports its result over a private,
+command-scoped status directory, and the owned process runner allows bounded
+graceful cleanup before force-killing remaining descendants. If a canceled
+`StartSession` request returns no session ID, the helper reports the cloud result
+as unknown rather than claiming successful cleanup; it does not retry or sweep
+other sessions. A local `SIGKILL`, host crash, or power loss can still prevent
+the helper from making its final API call; Crabbox intentionally does not run a
+daemon or an account-wide session sweeper. Connection loss does not release a retained
+lease, and normal explicit release still terminates only the exact lease-owned
+EC2 instance and key registration. Session Manager audit events identify
+session lifecycle, but AWS does not log SSH session contents.
 
 Root volumes default to 40 GB (`tiny`), 80 GB (`small`), 150 GB (`standard`
 and `fast`), 250 GB (`large`), or 400 GB (`beast`). An unset or zero `aws.rootGB`

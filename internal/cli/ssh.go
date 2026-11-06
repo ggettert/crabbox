@@ -68,6 +68,9 @@ type SSHTarget struct {
 	SSHConfigFile           string // Provider-owned IdentitiesOnly route; bypass ambient SSH config.
 	SSHConfigData           []byte `json:"-"` // Captured provider config; keep resolution and transport on the same bytes.
 	ProxyCommand            string
+	// ProxyCommandStatus asks the owned process runner to provide a private,
+	// command-scoped status directory to the proxy and verify its final result.
+	ProxyCommandStatus bool `json:"-"`
 	// AccessMetadata carries non-secret provider access identity into durable
 	// checkpoint records so forks can preserve the source transport.
 	AccessMetadata   map[string]string
@@ -78,6 +81,8 @@ type SSHTarget struct {
 	// Refresh provider-owned credential files before a new transport starts.
 	PrepareConnection func(context.Context) error `json:"-"`
 }
+
+const ProxyCommandStatusEnvironment = "CRABBOX_INTERNAL_PROXY_STATUS_DIR"
 
 func isLocalMacTarget(target SSHTarget) bool {
 	if runtime.GOOS != "darwin" || target.TargetOS != targetMacOS {
@@ -1122,7 +1127,7 @@ func (p *sshTransportPreparation) runOnce(ctx context.Context, target SSHTarget,
 	cmd := sshCommandContext(ctx, target, args...)
 	run := runSSHCommand
 	if runtime.GOOS != "windows" && usesSSHProxyTransport(target) {
-		handle := ownSSHCommandProcessTree(cmd)
+		handle := ownSSHCommandProcessTree(cmd, target)
 		run = func(_ *exec.Cmd, stdout, stderr io.Writer) error {
 			return runOwnedSSHCommandWithPlatformStreams(ctx, handle, stdout, stderr)
 		}

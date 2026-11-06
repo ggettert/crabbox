@@ -47,7 +47,7 @@ func (b *awsLeaseBackend) SupportsRequestedCheckpointID() bool { return true }
 
 func (b *awsLeaseBackend) ValidateCoordinatorAcquire() error {
 	if core.AWSSSHTransportForConfig(b.Cfg) == core.AWSSSHTransportSSM {
-		return core.Exit(2, "provider=aws aws.sshTransport=ssm requires direct mode; credentialless coordinator leases cannot grant the local AWS CLI an SSM session")
+		return core.Exit(2, "provider=aws aws.sshTransport=ssm requires direct mode; credentialless coordinator leases cannot grant the local helper an SSM session")
 	}
 	return nil
 }

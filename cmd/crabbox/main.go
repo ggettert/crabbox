@@ -13,6 +13,7 @@ import (
 
 	"github.com/openclaw/crabbox/internal/cli"
 	_ "github.com/openclaw/crabbox/internal/providers/all"
+	provideraws "github.com/openclaw/crabbox/internal/providers/aws"
 	"github.com/openclaw/crabbox/internal/providers/vercelsandbox"
 )
 
@@ -35,6 +36,8 @@ func run() int {
 	var err error
 	if len(args) > 0 && args[0] == "__vercel-sandbox-bridge" {
 		err = vercelsandbox.RunBridgeCLI(ctx, os.Stdin, stdout, stderr)
+	} else if len(args) > 0 && args[0] == "__aws-ssm-proxy" {
+		err = provideraws.RunSSMProxyCLI(ctx, args[1:], os.Stdin, stdout, stderr)
 	} else {
 		err = (cli.App{Stdin: os.Stdin, Stdout: stdout, Stderr: stderr}).Run(ctx, args)
 	}

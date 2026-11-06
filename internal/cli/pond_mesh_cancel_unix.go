@@ -63,13 +63,16 @@ func (h *pondMeshExecHandle) Start() error {
 	if err := h.prepareStart(); err != nil {
 		return err
 	}
+	if err := h.proxyStatus.prepare(h.cmd); err != nil {
+		return err
+	}
 	executable, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("resolve pond mesh anchor executable: %w", err)
+		return errors.Join(fmt.Errorf("resolve pond mesh anchor executable: %w", err), h.proxyStatus.cleanup())
 	}
 	anchorRead, anchorWrite, err := os.Pipe()
 	if err != nil {
-		return fmt.Errorf("create pond mesh anchor pipe: %w", err)
+		return errors.Join(fmt.Errorf("create pond mesh anchor pipe: %w", err), h.proxyStatus.cleanup())
 	}
 	anchor := exec.Command(executable, pondMeshAnchorArg)
 	anchor.Env = append(h.cmd.Environ(), pondMeshAnchorEnv+"=1")
@@ -78,7 +81,7 @@ func (h *pondMeshExecHandle) Start() error {
 	if err := anchor.Start(); err != nil {
 		_ = anchorRead.Close()
 		_ = anchorWrite.Close()
-		return fmt.Errorf("start pond mesh group anchor: %w", err)
+		return errors.Join(fmt.Errorf("start pond mesh group anchor: %w", err), h.proxyStatus.cleanup())
 	}
 	_ = anchorRead.Close()
 	h.platform.anchor = anchor
@@ -86,18 +89,23 @@ func (h *pondMeshExecHandle) Start() error {
 	h.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: anchor.Process.Pid}
 	if err := h.cmd.Start(); err != nil {
 		cleanupErr := h.finishPondMeshPlatform()
-		if cleanupErr != nil {
-			return errors.Join(err, cleanupErr)
-		}
-		return err
+		return errors.Join(err, cleanupErr, h.proxyStatus.cleanup())
 	}
 	return nil
 }
 
 func (h *pondMeshExecHandle) Wait() error {
 	err := h.cmd.Wait()
+	var statusErr error
+	if h.proxyStatus != nil {
+		_ = syscall.Kill(-h.platform.anchor.Process.Pid, syscall.SIGTERM)
+		statusErr = h.proxyStatus.wait(!h.cancelled.Load())
+		if killErr := syscall.Kill(-h.platform.anchor.Process.Pid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
+			statusErr = errors.Join(statusErr, fmt.Errorf("force cleanup of proxy command process group: %w", killErr))
+		}
+	}
 	cleanupErr := h.finishPondMeshPlatform()
-	return h.joinCancellationError(errors.Join(err, cleanupErr))
+	return h.joinCancellationError(errors.Join(err, statusErr, cleanupErr, h.proxyStatus.cleanup()))
 }
 
 func (h *pondMeshExecHandle) finishPondMeshPlatform() error {
@@ -113,7 +121,7 @@ func (h *pondMeshExecHandle) finishPondMeshPlatform() error {
 		err := h.platform.anchor.Wait()
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() && status.Signal() == syscall.SIGKILL {
+			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() && (status.Signal() == syscall.SIGKILL || h.proxyStatus != nil && status.Signal() == syscall.SIGTERM) {
 				return
 			}
 		}
@@ -125,6 +133,22 @@ func (h *pondMeshExecHandle) finishPondMeshPlatform() error {
 }
 
 func terminatePondMeshForwardProcess(h *pondMeshExecHandle) error {
+	if h.proxyStatus != nil && h.platform.anchor != nil && h.platform.anchor.Process != nil {
+		termErr := syscall.Kill(-h.platform.anchor.Process.Pid, syscall.SIGTERM)
+		if errors.Is(termErr, syscall.ESRCH) {
+			termErr = nil
+		}
+		statusErr := h.proxyStatus.wait(false)
+		killErr := syscall.Kill(-h.platform.anchor.Process.Pid, syscall.SIGKILL)
+		if errors.Is(killErr, syscall.ESRCH) {
+			killErr = nil
+		}
+		cleanupErr := h.finishPondMeshPlatform()
+		if termErr == nil && statusErr == nil && killErr == nil && cleanupErr == nil {
+			return nil
+		}
+		return errors.Join(termErr, statusErr, killErr, cleanupErr)
+	}
 	rootErr := h.cmd.Process.Kill()
 	cleanupErr := h.finishPondMeshPlatform()
 	if rootErr != nil {

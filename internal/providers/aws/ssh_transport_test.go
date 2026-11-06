@@ -15,20 +15,21 @@ import (
 	"github.com/openclaw/crabbox/internal/testutil"
 )
 
-func installAWSSSMDependencies(t *testing.T, awsCLI string) {
+func installAWSSSMDependencies(t *testing.T, executable string) {
 	t.Helper()
-	previous := awsSSMLookPath
+	previousLookPath := awsSSMLookPath
+	previousExecutable := awsSSMExecutable
 	awsSSMLookPath = func(name string) (string, error) {
-		switch name {
-		case "aws":
-			return awsCLI, nil
-		case "session-manager-plugin":
+		if name == "session-manager-plugin" {
 			return "/fixture/session-manager-plugin", nil
-		default:
-			return "", exec.ErrNotFound
 		}
+		return "", exec.ErrNotFound
 	}
-	t.Cleanup(func() { awsSSMLookPath = previous })
+	awsSSMExecutable = func() (string, error) { return executable, nil }
+	t.Cleanup(func() {
+		awsSSMLookPath = previousLookPath
+		awsSSMExecutable = previousExecutable
+	})
 }
 
 func TestAWSSSMTransportValidation(t *testing.T) {
@@ -58,16 +59,16 @@ func TestAWSSSMTransportValidation(t *testing.T) {
 func TestAWSSSMProxyCommandUsesInstanceRegionAndSSHPort(t *testing.T) {
 	dir := t.TempDir()
 	argsFile := filepath.Join(dir, "args")
-	cliDir := filepath.Join(dir, "aws % fixture;$(literal)")
+	cliDir := filepath.Join(dir, "crabbox % fixture;$(literal)")
 	if err := os.MkdirAll(cliDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	awsCLI := filepath.Join(cliDir, "aws cli")
+	executable := filepath.Join(cliDir, "crabbox cli")
 	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"" + argsFile + "\"\n"
-	if err := os.WriteFile(awsCLI, []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(executable, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	installAWSSSMDependencies(t, awsCLI)
+	installAWSSSMDependencies(t, executable)
 	cfg := core.Config{
 		Provider: "aws", TargetOS: core.TargetLinux, AWSRegion: "us-west-2",
 		AWSSSHTransport: core.AWSSSHTransportSSM, AWSProfile: "ec2-instance-profile-not-cli-profile", SSHPort: "2207",
@@ -78,10 +79,10 @@ func TestAWSSSMProxyCommandUsesInstanceRegionAndSSHPort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if target.Host != server.CloudID || target.Port != "2207" || target.ProxyCommand == "" {
+	if target.Host != server.CloudID || target.Port != "2207" || target.ProxyCommand == "" || !target.ProxyCommandStatus || !target.NoControlMaster {
 		t.Fatalf("target=%#v", target)
 	}
-	if strings.Contains(target.ProxyCommand, cfg.AWSProfile) || !strings.Contains(target.ProxyCommand, "portNumber=%p") {
+	if strings.Contains(target.ProxyCommand, cfg.AWSProfile) || !strings.Contains(target.ProxyCommand, "--port %p") {
 		t.Fatalf("proxy=%q", target.ProxyCommand)
 	}
 	command := expandSSHProxyCommandForTest(target.ProxyCommand, target.Port)
@@ -93,20 +94,31 @@ func TestAWSSSMProxyCommandUsesInstanceRegionAndSSHPort(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := strings.Fields(string(data))
-	want := []string{"ssm", "start-session", "--target", server.CloudID, "--document-name", "AWS-StartSSHSession", "--parameters", "portNumber=2207", "--region", "eu-west-1"}
+	want := []string{"__aws-ssm-proxy", "--target", server.CloudID, "--region", "eu-west-1", "--port", "2207", "--plugin", "/fixture/session-manager-plugin"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("args=%q, want %q", got, want)
+	}
+}
+
+func TestAWSDirectSSHTransportKeepsControlMasterDefault(t *testing.T) {
+	server := awsTestServer("i-0123456789abcdef0", "cbx_abcdef123456", "direct", "us-west-2")
+	target, err := sshTargetForAWSServer(core.Config{Provider: "aws", TargetOS: core.TargetLinux}, server, "203.0.113.10", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.ProxyCommand != "" || target.ProxyCommandStatus || target.NoControlMaster {
+		t.Fatalf("direct target changed: %#v", target)
 	}
 }
 
 func TestAWSSSMProxyCommandQuotesProviderValues(t *testing.T) {
 	dir := t.TempDir()
 	sentinel := filepath.Join(dir, "not-run")
-	awsCLI := filepath.Join(dir, "aws cli")
-	if err := os.WriteFile(awsCLI, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	executable := filepath.Join(dir, "crabbox cli")
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	command := awsSSMProxyCommand(awsCLI, "i-test'; touch "+sentinel+"; 'x", "us-test-1'; false; '")
+	command := awsSSMProxyCommand(executable, "/fixture/plugin path", "i-test'; touch "+sentinel+"; 'x", "us-test-1'; false; '")
 	if strings.Contains(command, "--profile") {
 		t.Fatalf("proxy unexpectedly selected an AWS CLI profile: %q", command)
 	}
@@ -135,7 +147,7 @@ func TestAWSSSMResolveRebuildsPersistedProxy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lease.SSH.Host != server.CloudID || !strings.Contains(lease.SSH.ProxyCommand, "AWS-StartSSHSession") || !strings.Contains(lease.SSH.ProxyCommand, "eu-west-1") {
+	if lease.SSH.Host != server.CloudID || !strings.Contains(lease.SSH.ProxyCommand, "__aws-ssm-proxy") || !strings.Contains(lease.SSH.ProxyCommand, "eu-west-1") || !lease.SSH.ProxyCommandStatus {
 		t.Fatalf("resolved SSH=%#v", lease.SSH)
 	}
 }
@@ -180,9 +192,6 @@ func TestAWSSSMClaimRecoveryRebuildsProxyWhenLiveTagIsAbsent(t *testing.T) {
 func TestAWSSSMDependenciesFailBeforeAWSCalls(t *testing.T) {
 	previousLookPath := awsSSMLookPath
 	awsSSMLookPath = func(name string) (string, error) {
-		if name == "aws" {
-			return "/fixture/aws", nil
-		}
 		return "", exec.ErrNotFound
 	}
 	t.Cleanup(func() { awsSSMLookPath = previousLookPath })

@@ -91,6 +91,9 @@ func pondMeshExecCommand(ctx context.Context, target SSHTarget, name string, arg
 	applyTargetChildEnvironment(cmd, target)
 	cmd.WaitDelay = pondMeshCancelWaitDelay
 	h := &pondMeshExecHandle{cmd: cmd}
+	if target.ProxyCommandStatus && sshCommandMayInvokeProxy(name, args) {
+		h.proxyStatus = &proxyCommandStatus{}
+	}
 	h.prepare = func() error { return prepareSSHConnection(ctx, target) }
 	// Kill the owned process tree so ProxyCommand descendants cannot outlive SSH.
 	// A catchable signal could produce a nonzero exit indistinguishable from a
@@ -99,8 +102,11 @@ func pondMeshExecCommand(ctx context.Context, target SSHTarget, name string, arg
 	return h
 }
 
-func ownSSHCommandProcessTree(cmd *exec.Cmd) *pondMeshExecHandle {
+func ownSSHCommandProcessTree(cmd *exec.Cmd, target SSHTarget) *pondMeshExecHandle {
 	h := &pondMeshExecHandle{cmd: cmd}
+	if target.ProxyCommandStatus {
+		h.proxyStatus = &proxyCommandStatus{}
+	}
 	h.cmd.Cancel = h.cancelAndKill
 	return h
 }
@@ -117,9 +123,10 @@ func pondMeshDaemonCommand(target SSHTarget, name string, args ...string) *exec.
 }
 
 type pondMeshExecHandle struct {
-	cmd      *exec.Cmd
-	prepare  func() error
-	platform pondMeshPlatformState
+	cmd         *exec.Cmd
+	prepare     func() error
+	platform    pondMeshPlatformState
+	proxyStatus *proxyCommandStatus
 	// Set before delivering the kill so a concurrent Wait observes provenance.
 	cancelled atomic.Bool
 	// cancelFailed makes cleanup/inventory failures observable instead of
@@ -127,6 +134,18 @@ type pondMeshExecHandle struct {
 	cancelFailed atomic.Bool
 	cancelErrMu  sync.Mutex
 	cancelErr    error
+}
+
+func sshCommandMayInvokeProxy(name string, args []string) bool {
+	if filepath.Base(name) != filepath.Base(directSSHExecutable()) {
+		return true
+	}
+	for _, arg := range args {
+		if arg == "-G" || arg == "-V" {
+			return false
+		}
+	}
+	return true
 }
 
 func (h *pondMeshExecHandle) prepareStart() error {
