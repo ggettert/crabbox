@@ -1120,6 +1120,13 @@ func (p *sshTransportPreparation) runOnce(ctx context.Context, target SSHTarget,
 		args = append(args, session.host(), p.command)
 	}
 	cmd := sshCommandContext(ctx, target, args...)
+	run := runSSHCommand
+	if runtime.GOOS != "windows" && usesSSHProxyTransport(target) {
+		handle := ownSSHCommandProcessTree(cmd)
+		run = func(_ *exec.Cmd, stdout, stderr io.Writer) error {
+			return runOwnedSSHCommandWithPlatformStreams(ctx, handle, stdout, stderr)
+		}
+	}
 	input, err := p.reset()
 	if err != nil {
 		return false, err
@@ -1154,9 +1161,9 @@ func (p *sshTransportPreparation) runOnce(ctx context.Context, target SSHTarget,
 		}
 	}()
 	if captureLocalDiagnostics {
-		return runSSHCommandWithLocalDiagnostics(cmd, stdout, stderr)
+		return runSSHCommandWithLocalDiagnosticsRunner(cmd, stdout, stderr, run)
 	}
-	return false, runSSHCommand(cmd, stdout, stderr)
+	return false, run(cmd, stdout, stderr)
 }
 
 func (p *sshTransportPreparation) reset() (io.Reader, error) {

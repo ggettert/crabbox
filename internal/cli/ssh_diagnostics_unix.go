@@ -22,8 +22,12 @@ type sshDiagnosticCapture struct {
 }
 
 func runSSHCommandWithLocalDiagnostics(cmd *exec.Cmd, stdout, stderr io.Writer) (bool, error) {
+	return runSSHCommandWithLocalDiagnosticsRunner(cmd, stdout, stderr, runSSHCommand)
+}
+
+func runSSHCommandWithLocalDiagnosticsRunner(cmd *exec.Cmd, stdout, stderr io.Writer, run func(*exec.Cmd, io.Writer, io.Writer) error) (bool, error) {
 	capture := sshDiagnosticCapture{output: boundedSSHOutput{limit: sshDiagnosticOutputLimit}}
-	complete, runErr := runSSHCommandCapturingDiagnostics(cmd, stdout, stderr, &capture)
+	complete, runErr := runSSHCommandCapturingDiagnostics(cmd, stdout, stderr, &capture, run)
 	// Forward only after capture has stopped and cleaned up. An arbitrary
 	// caller-supplied writer cannot be made interruptible by the FIFO reader.
 	var outputErr error
@@ -36,7 +40,7 @@ func runSSHCommandWithLocalDiagnostics(cmd *exec.Cmd, stdout, stderr io.Writer) 
 	return complete && outputErr == nil && capture.detector.failed(), errors.Join(runErr, outputErr)
 }
 
-func runSSHCommandCapturingDiagnostics(cmd *exec.Cmd, stdout, stderr io.Writer, capture *sshDiagnosticCapture) (muxFailure bool, err error) {
+func runSSHCommandCapturingDiagnostics(cmd *exec.Cmd, stdout, stderr io.Writer, capture *sshDiagnosticCapture, run func(*exec.Cmd, io.Writer, io.Writer) error) (muxFailure bool, err error) {
 	dir, err := os.MkdirTemp("", "crabbox-ssh-diagnostics-*")
 	if err != nil {
 		return false, err
@@ -81,7 +85,7 @@ func runSSHCommandCapturingDiagnostics(cmd *exec.Cmd, stdout, stderr io.Writer, 
 		complete, captureErr := drainSSHDiagnostics(fd, int(done.Fd()), keeper, capture)
 		result <- captureResult{complete, captureErr}
 	}()
-	runErr := runSSHCommand(cmd, stdout, stderr)
+	runErr := run(cmd, stdout, stderr)
 	_ = wake.Close()
 	captured := <-result
 	return captured.complete && captured.err == nil, errors.Join(runErr, captured.err)

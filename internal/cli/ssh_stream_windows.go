@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -394,4 +395,8 @@ func markCommandStreamDeletePending(handle windows.Handle, path *uint16) error {
 		return nil
 	}
 	return windows.DeleteFile(path)
+}
+
+func runOwnedSSHCommandWithPlatformStreams(ctx context.Context, handle *pondMeshExecHandle, stdout, stderr io.Writer) error {
+	return runCommandWithPlatformStreams(handle.cmd, stdout, stderr)
 }

@@ -99,6 +99,12 @@ func pondMeshExecCommand(ctx context.Context, target SSHTarget, name string, arg
 	return h
 }
 
+func ownSSHCommandProcessTree(cmd *exec.Cmd) *pondMeshExecHandle {
+	h := &pondMeshExecHandle{cmd: cmd}
+	h.cmd.Cancel = h.cancelAndKill
+	return h
+}
+
 // Exported tunnels outlive the caller, so they have no CommandContext watchdog.
 func pondMeshDaemonCommand(target SSHTarget, name string, args ...string) *exec.Cmd {
 	cmd := exec.Command(name, args...)
