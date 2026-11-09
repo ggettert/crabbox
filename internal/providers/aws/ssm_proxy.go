@@ -148,7 +148,11 @@ func runSSMProxy(ctx context.Context, opts ssmProxyOptions, reporter *ssmProxyLi
 	if err != nil {
 		startErr := safeSSMProxyError("start SSM session", err)
 		if sessionID == "" {
-			lifecycleErr = errors.Join(startErr, errors.New("SSM session start outcome is unknown because no session ID was returned"))
+			outcome := errors.New("SSM session start outcome is unknown because no session ID was returned")
+			if isDefiniteSSMStartRejection(err) {
+				outcome = errors.New("SSM session start was rejected before a session was created")
+			}
+			lifecycleErr = errors.Join(startErr, outcome)
 			return lifecycleErr
 		}
 		owner := ssmProxySessionOwner{client: client, sessionID: sessionID}
@@ -379,19 +383,34 @@ func redactSSMProxyDiagnostic(value string, response *ssm.StartSessionOutput) st
 	)
 }
 
+func isDefiniteSSMStartRejection(err error) bool {
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.ErrorCode() {
+	case "TargetNotConnected", "ThrottlingException", "ThrottledException", "TooManyRequestsException", "RequestLimitExceeded",
+		"AccessDeniedException", "UnauthorizedException", "UnrecognizedClientException", "InvalidClientTokenId",
+		"ValidationException", "InvalidParameters", "InvalidInstanceId", "UnsupportedOperationException":
+		return true
+	default:
+		return false
+	}
+}
+
 func safeSSMProxyError(action string, err error) error {
 	if err == nil {
 		return nil
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		return fmt.Errorf("%s: AWS API error %s", action, apiErr.ErrorCode())
 	}
 	if errors.Is(err, context.Canceled) {
 		return fmt.Errorf("%s: %w", action, context.Canceled)
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Errorf("%s: %w", action, context.DeadlineExceeded)
-	}
-	var apiErr smithy.APIError
-	if errors.As(err, &apiErr) {
-		return fmt.Errorf("%s: AWS API error %s", action, apiErr.ErrorCode())
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {

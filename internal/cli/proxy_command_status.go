@@ -26,6 +26,7 @@ const (
 	proxyCommandFailureLifecycleCleanup proxyCommandFailureClass = "lifecycle_cleanup"
 	proxyCommandFailureUnknownOutcome   proxyCommandFailureClass = "unknown_session_outcome"
 	proxyCommandFailurePermissionDenied proxyCommandFailureClass = "api_permission_denied"
+	proxyCommandFailureAPIRejected      proxyCommandFailureClass = "api_rejected"
 )
 
 type proxyCommandStatusError struct {
@@ -43,7 +44,7 @@ func (e *proxyCommandStatusError) Error() string {
 
 func (e *proxyCommandStatusError) readinessFatal() bool {
 	switch e.class {
-	case proxyCommandFailureLifecycleCleanup, proxyCommandFailureUnknownOutcome, proxyCommandFailurePermissionDenied:
+	case proxyCommandFailureLifecycleCleanup, proxyCommandFailureUnknownOutcome, proxyCommandFailurePermissionDenied, proxyCommandFailureAPIRejected:
 		return true
 	default:
 		return false
@@ -51,15 +52,39 @@ func (e *proxyCommandStatusError) readinessFatal() bool {
 }
 
 func classifyProxyCommandStatusError(result string) *proxyCommandStatusError {
+	code := ""
+	if strings.Contains(result, "AWS API error ") || strings.Contains(result, "context deadline exceeded") || strings.Contains(result, "SSM session start outcome is unknown") {
+		code = safeProxyCommandStatusCode(result)
+	}
 	switch {
 	case strings.Contains(result, "terminate owned SSM session"):
-		return &proxyCommandStatusError{class: proxyCommandFailureLifecycleCleanup, code: safeProxyCommandStatusCode(result)}
-	case strings.Contains(result, "AWS API error AccessDeniedException"):
-		return &proxyCommandStatusError{class: proxyCommandFailurePermissionDenied, code: "AccessDeniedException"}
+		return &proxyCommandStatusError{class: proxyCommandFailureLifecycleCleanup, code: code}
+	case isPermissionDeniedProxyCode(code):
+		return &proxyCommandStatusError{class: proxyCommandFailurePermissionDenied, code: code}
 	case strings.Contains(result, "SSM session start outcome is unknown"):
-		return &proxyCommandStatusError{class: proxyCommandFailureUnknownOutcome}
+		return &proxyCommandStatusError{class: proxyCommandFailureUnknownOutcome, code: code}
+	case strings.Contains(result, "SSM session start was rejected") && isFatalSSMStartRejectionCode(code):
+		return &proxyCommandStatusError{class: proxyCommandFailureAPIRejected, code: code}
 	default:
-		return &proxyCommandStatusError{class: proxyCommandFailureLifecycle}
+		return &proxyCommandStatusError{class: proxyCommandFailureLifecycle, code: code}
+	}
+}
+
+func isPermissionDeniedProxyCode(code string) bool {
+	switch code {
+	case "AccessDeniedException", "UnauthorizedException", "UnrecognizedClientException", "InvalidClientTokenId":
+		return true
+	default:
+		return false
+	}
+}
+
+func isFatalSSMStartRejectionCode(code string) bool {
+	switch code {
+	case "ValidationException", "InvalidParameters", "InvalidInstanceId", "UnsupportedOperationException":
+		return true
+	default:
+		return false
 	}
 }
 

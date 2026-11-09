@@ -1251,6 +1251,7 @@ func executeSSH(ctx context.Context, target *SSHTarget, remote string, input io.
 // executeSSHWithRetirement keeps remote lifetime evidence separate from local
 // diagnostics and spool errors. An owner cleanup failure remains conservative.
 func executeSSHWithRetirement(ctx context.Context, target *SSHTarget, remote string, input io.ReadSeeker, size int64, limit sshCommandLimit, connectTimeout, attempts string, stdout, stderr io.Writer) (retirementUnconfirmed bool, err error) {
+	owner := workspaceOwnerFromContext(ctx)
 	var inputSize *int64
 	if input != nil {
 		inputSize = &size
@@ -1272,7 +1273,14 @@ func executeSSHWithRetirement(ctx context.Context, target *SSHTarget, remote str
 	}
 	transport.setupMarker = prepared.setupMarker
 	err = transport.execute(ctx, target, limit, connectTimeout, attempts, stdout, stderr)
-	return transport.retirementUnconfirmed, err
+	retirementUnconfirmed = transport.retirementUnconfirmed
+	if err != nil && retirementUnconfirmed && context.Cause(ctx) != nil && owner != nil && !isWindowsNativeTarget(*target) {
+		cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), owner.quiesceTimeout())
+		cancelErr := owner.CancelChild(cancelCtx)
+		cancel()
+		err = errors.Join(context.Cause(ctx), err, cancelErr)
+	}
+	return retirementUnconfirmed, err
 }
 
 func executePreparedSSH(ctx context.Context, target *SSHTarget, command string, input io.ReadSeeker, size int64, limit sshCommandLimit, connectTimeout, attempts string, stdout, stderr io.Writer) (err error) {

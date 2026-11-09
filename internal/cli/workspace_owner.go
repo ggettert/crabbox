@@ -58,6 +58,7 @@ const (
 	workspaceOwnerAcquire workspaceOwnerAction = "acquire"
 	workspaceOwnerRenew   workspaceOwnerAction = "renew"
 	workspaceOwnerInspect workspaceOwnerAction = "inspect"
+	workspaceOwnerCancel  workspaceOwnerAction = "cancel"
 	workspaceOwnerRelease workspaceOwnerAction = "release"
 )
 
@@ -662,6 +663,27 @@ func finishRsyncWorkspaceWitness(ctx context.Context, target SSHTarget, owner *w
 	return runSSHQuiet(rawCtx, target, owner.rsyncPrepareCommand())
 }
 
+func (o *workspaceOwner) CancelChild(ctx context.Context) error {
+	if o == nil {
+		return nil
+	}
+	if isWindowsNativeTarget(o.target) {
+		return Exit(7, "cancel remote workspace owner child failed closed: unsupported target")
+	}
+	if err := o.Err(); err != nil {
+		return err
+	}
+	response, err := callWorkspaceOwnerTransport(ctx, o.callTimeout(), o.transport, workspaceOwnerRemoteRequest{Action: workspaceOwnerCancel, Key: o.key, Token: o.token, TTL: o.ttl})
+	if err != nil {
+		err = workspaceOwnerProtocolError(response, err)
+		return workspaceOwnerCallError("cancel remote workspace owner child", err)
+	}
+	if response != "CANCELED" {
+		return Exit(7, "cancel remote workspace owner child failed closed: %s", strings.ToLower(firstNonBlank(response, "ambiguous")))
+	}
+	return nil
+}
+
 func (o *workspaceOwner) Close(ctx context.Context) (err error) {
 	if o == nil {
 		return nil
@@ -776,7 +798,24 @@ func workspaceOwnerTTLSeconds(ttl time.Duration) int64 {
 
 // Signal denial or exit between liveness probes requires independent PID-only
 // absence evidence before erasing a witness (no process arguments).
-const workspaceOwnerPOSIXProcess = `owner_process_status() {
+const workspaceOwnerPOSIXProcess = `owner_process_strong_identity() {
+  if [ -r "/proc/$1/stat" ]; then
+    process_stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+    process_fields=${process_stat##*) }
+    [ "$process_fields" != "$process_stat" ] || return 1
+    set -- $process_fields
+    [ "$#" -ge 20 ] || return 1
+    shift 19
+    started=$1
+    case "$started" in ''|*[!0-9]*) return 1 ;; esac
+    printf 'linux:%s' "$started"
+    return 0
+  fi
+  started=$(ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//' | cut -c1-90) || return 1
+  [ -n "$started" ] || return 1
+  printf 'ps:%s' "$started"
+}
+owner_process_status() {
   if kill -0 "$1" 2>/dev/null; then
     live_identity=$(ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//' | cut -c1-96)
     if [ -n "$live_identity" ]; then
@@ -788,6 +827,55 @@ const workspaceOwnerPOSIXProcess = `owner_process_status() {
   matching_pid=$(printf '%s\n' "$observed_pids" | awk -v pid="$1" '$1 == pid { print $1 }') || return 2
   [ -z "$matching_pid" ] || return 2
   return 1
+}
+owner_group_status() {
+  group_rows=$(ps -e -o pid= -o pgid= -o sid= -o stat= 2>/dev/null) || return 2
+  group_live=$(printf '%s\n' "$group_rows" | awk -v pgid="$1" -v sid="$2" '$2 == pgid && $3 == sid && $4 !~ /^Z/ { print $1; exit }') || return 2
+  [ -z "$group_live" ] && return 1
+  return 0
+}
+owner_child_status() {
+  owner_child_file=$1
+  [ -f "$owner_child_file" ] || return 1
+  owner_child_lines=$(awk 'END { print NR }' "$owner_child_file" 2>/dev/null) || return 2
+  owner_child_pid=$(sed -n '1p' "$owner_child_file" 2>/dev/null || true)
+  owner_child_identity=$(sed -n '2p' "$owner_child_file" 2>/dev/null || true)
+  case "$owner_child_pid" in ''|*[!0-9]*) return 2 ;; esac
+  [ -n "$owner_child_identity" ] && [ "${#owner_child_identity}" -le 96 ] || return 2
+  if [ "$owner_child_lines" -eq 2 ]; then
+    owner_process_status "$owner_child_pid" "$owner_child_identity"
+    return
+  fi
+  [ "$owner_child_lines" -eq 5 ] || return 2
+  owner_child_pgid=$(sed -n '3p' "$owner_child_file" 2>/dev/null || true)
+  owner_child_sid=$(sed -n '4p' "$owner_child_file" 2>/dev/null || true)
+  owner_child_start=$(sed -n '5p' "$owner_child_file" 2>/dev/null || true)
+  case "$owner_child_pgid:$owner_child_sid" in *[!0-9:]*) return 2 ;; esac
+  case "$owner_child_start" in
+    ps:*)
+      [ "${#owner_child_start}" -le 96 ] || return 2
+      owner_process_status "$owner_child_pid" "$owner_child_identity"
+      return
+      ;;
+    linux:*) owner_child_start_value=${owner_child_start#linux:} ;;
+    *) return 2 ;;
+  esac
+  [ "$owner_child_pid" = "$owner_child_pgid" ] && [ "$owner_child_pid" = "$owner_child_sid" ] || return 2
+  case "$owner_child_start_value" in ''|*[!0-9]*) return 2 ;; esac
+  if owner_process_status "$owner_child_pid" "$owner_child_identity"; then
+    owner_live_start=$(owner_process_strong_identity "$owner_child_pid" 2>/dev/null || true)
+    case "$owner_live_start" in linux:*) ;; *) return 2 ;; esac
+    owner_live_pgid=$(ps -o pgid= -p "$owner_child_pid" 2>/dev/null | tr -d ' ') || return 2
+    owner_live_sid=$(ps -o sid= -p "$owner_child_pid" 2>/dev/null | tr -d ' ') || return 2
+    case "$owner_live_pgid:$owner_live_sid" in *[!0-9:]*) return 2 ;; esac
+    if [ "$owner_live_start" = "$owner_child_start" ] && [ "$owner_live_pgid" = "$owner_child_pgid" ] && [ "$owner_live_sid" = "$owner_child_sid" ]; then
+      return 0
+    fi
+  else
+    owner_child_rc=$?
+    [ "$owner_child_rc" -ne 2 ] || return 2
+  fi
+  owner_group_status "$owner_child_pgid" "$owner_child_sid"
 }
 `
 
@@ -846,6 +934,7 @@ action=` + shellQuote(string(req.Action)) + `
 ttl=` + strconv.FormatInt(workspaceOwnerTTLSeconds(req.TTL), 10) + `
 state="$root/$key.owner"
 child="$root/$key.child"
+canceled="$root/$key.canceled"
 mkdir -p "$root"
 chmod 700 "$HOME/.crabbox" "$root" 2>/dev/null || true
 read_state() {
@@ -866,12 +955,7 @@ write_state() {
   mv "$tmp" "$state"
 }
 child_status() {
-  [ -f "$child" ] || return 1
-  child_pid=$(sed -n '1p' "$child" 2>/dev/null || true)
-  child_identity=$(sed -n '2p' "$child" 2>/dev/null || true)
-  case "$child_pid" in ''|*[!0-9]*) return 2 ;; esac
-  [ -n "$child_identity" ] && [ "${#child_identity}" -le 96 ] || return 2
-  owner_process_status "$child_pid" "$child_identity"
+  owner_child_status "$child"
 }
 case "$action" in
   acquire)
@@ -880,13 +964,14 @@ case "$action" in
       if [ "$state_expiry" -gt "$now" ]; then printf BUSY; exit 0; fi
       if child_status; then printf CHILD; exit 0; else child_rc=$?; fi
       if [ "$child_rc" -eq 2 ]; then printf AMBIGUOUS; exit 74; fi
-      rm -f "$child"
+      rm -f "$child" "$canceled"
       write_state
       printf RECOVERED
       exit 0
     else state_rc=$?; fi
     if [ "$state_rc" -eq 2 ]; then printf AMBIGUOUS; exit 74; fi
     [ ! -e "$state" ] || { printf AMBIGUOUS; exit 74; }
+    rm -f "$canceled"
     write_state
     printf ACQUIRED
     ;;
@@ -906,12 +991,69 @@ case "$action" in
     rm -f "$child"
     printf OWNED
     ;;
+  cancel)
+    read_state || { printf AMBIGUOUS; exit 74; }
+    [ "$state_token" = "$token" ] || { printf MISMATCH; exit 75; }
+    [ "$state_expiry" -gt "$(date +%s)" ] || { printf EXPIRED; exit 75; }
+    canceled_tmp="$canceled.tmp.$$"
+    (umask 077; printf '%s\n' "$token" >"$canceled_tmp")
+    mv "$canceled_tmp" "$canceled"
+    if [ ! -f "$child" ]; then printf CANCELED; exit 0; fi
+    child_pid=$(sed -n '1p' "$child" 2>/dev/null || true)
+    child_identity=$(sed -n '2p' "$child" 2>/dev/null || true)
+    child_pgid=$(sed -n '3p' "$child" 2>/dev/null || true)
+    child_sid=$(sed -n '4p' "$child" 2>/dev/null || true)
+    child_start=$(sed -n '5p' "$child" 2>/dev/null || true)
+    child_lines=$(awk 'END { print NR }' "$child" 2>/dev/null) || { printf AMBIGUOUS; exit 74; }
+    [ "$child_lines" -eq 5 ] || { printf AMBIGUOUS; exit 74; }
+    case "$child_pid:$child_pgid:$child_sid" in *[!0-9:]*) printf AMBIGUOUS; exit 74 ;; esac
+    [ -n "$child_pid" ] && [ "$child_pid" = "$child_pgid" ] && [ "$child_pid" = "$child_sid" ] || { printf AMBIGUOUS; exit 74; }
+    [ -n "$child_identity" ] && [ "${#child_identity}" -le 96 ] || { printf AMBIGUOUS; exit 74; }
+    case "$child_start" in linux:*) child_start_value=${child_start#linux:} ;; *) printf AMBIGUOUS; exit 74 ;; esac
+    case "$child_start_value" in ''|*[!0-9]*) printf AMBIGUOUS; exit 74 ;; esac
+    if owner_process_status "$child_pid" "$child_identity"; then
+      live_start=$(owner_process_strong_identity "$child_pid" 2>/dev/null || true)
+      live_pgid=$(ps -o pgid= -p "$child_pid" 2>/dev/null | tr -d ' ')
+      live_sid=$(ps -o sid= -p "$child_pid" 2>/dev/null | tr -d ' ')
+      [ "$live_start" = "$child_start" ] && [ "$live_pgid" = "$child_pgid" ] && [ "$live_sid" = "$child_sid" ] || { printf AMBIGUOUS; exit 74; }
+      kill -TERM -- "-$child_pgid" 2>/dev/null || { printf AMBIGUOUS; exit 74; }
+      left=20
+      while :; do
+        if owner_group_status "$child_pgid" "$child_sid"; then group_rc=0; else group_rc=$?; break; fi
+        [ "$left" -gt 0 ] || break
+        sleep .1
+        left=$((left - 1))
+      done
+      [ "$group_rc" -ne 2 ] || { printf AMBIGUOUS; exit 74; }
+      if [ "$group_rc" -eq 0 ]; then
+        owner_process_status "$child_pid" "$child_identity" || { printf AMBIGUOUS; exit 74; }
+        live_start=$(owner_process_strong_identity "$child_pid" 2>/dev/null || true)
+        live_pgid=$(ps -o pgid= -p "$child_pid" 2>/dev/null | tr -d ' ')
+        live_sid=$(ps -o sid= -p "$child_pid" 2>/dev/null | tr -d ' ')
+        [ "$live_start" = "$child_start" ] && [ "$live_pgid" = "$child_pgid" ] && [ "$live_sid" = "$child_sid" ] || { printf AMBIGUOUS; exit 74; }
+        kill -KILL -- "-$child_pgid" 2>/dev/null || { printf AMBIGUOUS; exit 74; }
+        left=20
+        while :; do
+          if owner_group_status "$child_pgid" "$child_sid"; then group_rc=0; else group_rc=$?; break; fi
+          [ "$left" -gt 0 ] || { printf AMBIGUOUS; exit 74; }
+          sleep .1
+          left=$((left - 1))
+        done
+        [ "$group_rc" -eq 1 ] || { printf AMBIGUOUS; exit 74; }
+      fi
+    else child_rc=$?; [ "$child_rc" -eq 1 ] || { printf AMBIGUOUS; exit 74; }
+      if owner_group_status "$child_pgid" "$child_sid"; then printf AMBIGUOUS; exit 74; else group_rc=$?; fi
+      [ "$group_rc" -eq 1 ] || { printf AMBIGUOUS; exit 74; }
+    fi
+    rm -f "$child"
+    printf CANCELED
+    ;;
   release)
     read_state || { printf AMBIGUOUS; exit 74; }
     [ "$state_token" = "$token" ] || { printf MISMATCH; exit 75; }
     if child_status; then printf CHILD; exit 75; else child_rc=$?; fi
     [ "$child_rc" -ne 2 ] || { printf AMBIGUOUS; exit 74; }
-    rm -f "$child" "$state"
+    rm -f "$child" "$canceled" "$state"
     [ ! -e "$state" ] || { printf AMBIGUOUS; exit 74; }
     printf RELEASED
     ;;
@@ -1121,29 +1263,51 @@ func remoteWorkspaceOwnerPOSIXWitnessScript(key, token, remote, setupMarker stri
 owner_expiry=$(sed -n '3p' "$state" 2>/dev/null || true)
 case "$owner_expiry" in ''|*[!0-9]*) exit 74 ;; esac
 [ "$owner_expiry" -gt "$(date +%s)" ] || exit 75
+if [ -e "$canceled" ]; then
+  [ -f "$canceled" ] || exit 74
+  [ "$(sed -n '1p' "$canceled" 2>/dev/null || true)" != "$token" ] || exit 75
+fi
 kill -0 "$child_pid" 2>/dev/null || exit 74
 live_child_identity=$(ps -o lstart= -p "$child_pid" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//' | cut -c1-96)
+live_child_start=$(owner_process_strong_identity "$child_pid" 2>/dev/null || true)
 [ -n "$live_child_identity" ] && [ "$live_child_identity" = "$child_identity" ] || exit 74
+[ -n "$live_child_start" ] && [ "$live_child_start" = "$child_start" ] || exit 74
+live_child_pgid=$(ps -o pgid= -p "$child_pid" 2>/dev/null | tr -d ' ')
+live_child_sid=$(ps -o sid= -p "$child_pid" 2>/dev/null | tr -d ' ')
+[ "$live_child_pgid" = "$child_pgid" ] && [ "$live_child_sid" = "$child_sid" ] || exit 74
 if [ -f "$child" ]; then
-	existing_pid=$(sed -n '1p' "$child" 2>/dev/null || true)
-	existing_identity=$(sed -n '2p' "$child" 2>/dev/null || true)
-	case "$existing_pid" in ''|*[!0-9]*) exit 74 ;; esac
-	[ -n "$existing_identity" ] && [ "${#existing_identity}" -le 96 ] || exit 74
-	if owner_process_status "$existing_pid" "$existing_identity"; then exit 75; else existing_rc=$?; fi
+	if owner_child_status "$child"; then exit 75; else existing_rc=$?; fi
 	[ "$existing_rc" -ne 2 ] || exit 74
 	rm -f "$child"
 fi
 child_tmp="$child.tmp.$$"
-(umask 077; printf '%s\n%s\n' "$child_pid" "$child_identity" >"$child_tmp")
+(umask 077; printf '%s\n%s\n%s\n%s\n%s\n' "$child_pid" "$child_identity" "$child_pgid" "$child_sid" "$child_start" >"$child_tmp")
 mv "$child_tmp" "$child"`
 	clearBody := `set -eu
 ` + workspaceOwnerPOSIXProcess + `
 [ "$(sed -n '2p' "$state" 2>/dev/null || true)" = "$token" ] || exit 75
+recorded_lines=$(awk 'END { print NR }' "$child" 2>/dev/null) || exit 74
 recorded_pid=$(sed -n '1p' "$child" 2>/dev/null || true)
 recorded_identity=$(sed -n '2p' "$child" 2>/dev/null || true)
 [ "$recorded_pid" = "$child_pid" ] && [ "$recorded_identity" = "$child_identity" ] || exit 74
+recorded_start=""
+if [ "$recorded_lines" -eq 5 ]; then
+  recorded_pgid=$(sed -n '3p' "$child" 2>/dev/null || true)
+  recorded_sid=$(sed -n '4p' "$child" 2>/dev/null || true)
+  recorded_start=$(sed -n '5p' "$child" 2>/dev/null || true)
+  [ "$recorded_pgid" = "$child_pgid" ] && [ "$recorded_sid" = "$child_sid" ] && [ "$recorded_start" = "$child_start" ] || exit 74
+elif [ "$recorded_lines" -ne 2 ]; then
+  exit 74
+fi
 if owner_process_status "$recorded_pid" "$recorded_identity"; then exit 74; else recorded_rc=$?; fi
 [ "$recorded_rc" -ne 2 ] || exit 74
+case "$recorded_start" in
+  linux:*)
+    [ "$recorded_pid" = "$recorded_pgid" ] && [ "$recorded_pid" = "$recorded_sid" ] || exit 74
+    if owner_group_status "$recorded_pgid" "$recorded_sid"; then exit 74; else group_rc=$?; fi
+    [ "$group_rc" -eq 1 ] || exit 74
+    ;;
+esac
 rm -f "$child"`
 	// An asynchronous shell list makes INT/QUIT ignored before exec. Register in
 	// a foreground shell instead; close its identity pipe before user code runs.
@@ -1165,18 +1329,21 @@ rm -f "$child"`
   exec /bin/sh -c "$owner_command" cbx "$@"' cbx "$owner_command" "$@"` + inputRedirect + `
 fi
 `
-	registrar := diagnostic + `set -u
+	registrar := diagnostic + workspaceOwnerPOSIXProcess + `set -u
 trap '' HUP
 trap 'rm -rf "$run_dir" 2>/dev/null' 0
 trap 'trap "" PIPE; setup_failed handoff' PIPE
 child_pid=$$
 child_identity=$(ps -o lstart= -p "$child_pid" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//' | cut -c1-96)
-[ -n "$child_identity" ] || setup_failed identity
-export child_pid child_identity
+child_start=$(owner_process_strong_identity "$child_pid" 2>/dev/null || true)
+child_pgid=$(ps -o pgid= -p "$child_pid" 2>/dev/null | tr -d ' ')
+child_sid=$(ps -o sid= -p "$child_pid" 2>/dev/null | tr -d ' ')
+[ -n "$child_identity" ] && [ -n "$child_start" ] && [ -n "$child_pgid" ] && [ -n "$child_sid" ] || setup_failed identity
+export child_pid child_identity child_pgid child_sid child_start
 eval "$owner_gate_function"
 unset owner_gate_function
 run_owner_gate ` + shellQuote(installBody) + ` || setup_failed registration "$?"
-printf '%s\n%s\n' "$child_pid" "$child_identity" >&3 || setup_failed handoff
+printf '%s\n%s\n%s\n%s\n%s\n' "$child_pid" "$child_identity" "$child_pgid" "$child_sid" "$child_start" >&3 || setup_failed handoff
 exec 3>&-
 umask "$command_umask"
 ` + started + `owner_command=` + shellQuote(remote) + `
@@ -1190,25 +1357,33 @@ key=` + shellQuote(key) + `
 token=` + shellQuote(token) + `
 state="$root/$key.owner"
 child="$root/$key.child"
+canceled="$root/$key.canceled"
 gate="$root/$key.gate"
 run_dir="$root/$key.run.$token.$$"
 owner_gate_function=` + shellQuote(gateFunction) + `
 eval "$owner_gate_function"
 mkdir -m 700 "$run_dir" 2>/dev/null || setup_failed staging
-` + inputSetup + `export state child gate token command_umask run_dir owner_gate_function
+` + inputSetup + `export state child canceled gate token command_umask run_dir owner_gate_function
 exec 4>&1
 trap : INT QUIT
 set +e
-identity=$(exec /bin/sh -c ` + shellQuote(registrar) + ` cbx "$@" 3>&1 1>&4 4>&-)
+if [ "$(uname -s)" != Darwin ] && command -v setsid >/dev/null 2>&1; then
+  identity=$(exec setsid /bin/sh -c ` + shellQuote(registrar) + ` cbx "$@" 3>&1 1>&4 4>&-)
+else
+  identity=$(exec /bin/sh -c ` + shellQuote(registrar) + ` cbx "$@" 3>&1 1>&4 4>&-)
+fi
 code=$?
 trap - INT QUIT
 exec 4>&-
 if [ -z "$identity" ]; then rm -rf "$run_dir" 2>/dev/null; [ "$code" -ne 0 ] || code=74; setup_failed handoff "$code"; fi
 child_pid=$(printf '%s\n' "$identity" | sed -n '1p')
 child_identity=$(printf '%s\n' "$identity" | sed -n '2p')
-case "$child_pid" in ''|*[!0-9]*) rm -rf "$run_dir" 2>/dev/null; exit 74 ;; esac
-if [ -z "$child_identity" ] || [ "${#child_identity}" -gt 96 ]; then rm -rf "$run_dir" 2>/dev/null; exit 74; fi
-export child_pid child_identity
+child_pgid=$(printf '%s\n' "$identity" | sed -n '3p')
+child_sid=$(printf '%s\n' "$identity" | sed -n '4p')
+child_start=$(printf '%s\n' "$identity" | sed -n '5p')
+case "$child_pid:$child_pgid:$child_sid" in *[!0-9:]*) rm -rf "$run_dir" 2>/dev/null; exit 74 ;; esac
+if [ -z "$child_identity" ] || [ "${#child_identity}" -gt 96 ] || [ -z "$child_start" ] || [ "${#child_start}" -gt 96 ]; then rm -rf "$run_dir" 2>/dev/null; exit 74; fi
+export child_pid child_identity child_pgid child_sid child_start
 run_owner_gate ` + shellQuote(clearBody) + `
 clear_status=$?
 rm -rf "$run_dir"

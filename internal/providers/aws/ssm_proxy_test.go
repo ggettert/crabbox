@@ -195,6 +195,44 @@ func TestSSMProxyStartFailureDoesNotTerminateOrLaunchPlugin(t *testing.T) {
 	}
 }
 
+func TestSSMProxyStartFailureOutcomeClassification(t *testing.T) {
+	plugin := testSSMProxyPlugin(t, "exit 99")
+	for _, test := range []struct {
+		name        string
+		err         error
+		want        string
+		wantUnknown bool
+	}{
+		{name: "target not connected", err: &smithy.GenericAPIError{Code: "TargetNotConnected", Message: "private target detail", Fault: smithy.FaultClient}, want: "TargetNotConnected"},
+		{name: "throttled", err: &smithy.GenericAPIError{Code: "ThrottlingException", Message: "private throttle detail", Fault: smithy.FaultClient}, want: "ThrottlingException"},
+		{name: "access denied despite cancellation wrapper", err: errors.Join(context.Canceled, &smithy.GenericAPIError{Code: "AccessDeniedException", Message: "private auth detail", Fault: smithy.FaultClient}), want: "AccessDeniedException"},
+		{name: "validation", err: &smithy.GenericAPIError{Code: "ValidationException", Message: "private validation detail", Fault: smithy.FaultClient}, want: "ValidationException"},
+		{name: "server fault", err: &smithy.GenericAPIError{Code: "InternalServerError", Message: "private server detail", Fault: smithy.FaultServer}, want: "InternalServerError", wantUnknown: true},
+		{name: "network timeout", err: context.DeadlineExceeded, want: "context deadline exceeded", wantUnknown: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &fakeSSMProxyAPI{start: func(context.Context, *ssm.StartSessionInput) (*ssm.StartSessionOutput, error) {
+				return nil, test.err
+			}}
+			installSSMProxyClient(t, client)
+			reporter := testSSMProxyReporter(t)
+			err := runSSMProxy(t.Context(), ssmProxyOptions{target: "i-0123456789abcdef0", region: "us-test-1", port: "22", plugin: plugin}, reporter, nil, io.Discard, io.Discard)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%v", err)
+			}
+			if got := strings.Contains(err.Error(), "SSM session start outcome is unknown"); got != test.wantUnknown {
+				t.Fatalf("unknown=%t want=%t error=%v", got, test.wantUnknown, err)
+			}
+			if strings.Contains(err.Error(), "private") {
+				t.Fatalf("error leaked service message: %v", err)
+			}
+			if client.startCalls != 1 || len(client.terminateCalls) != 0 {
+				t.Fatalf("start=%d terminate=%q", client.startCalls, client.terminateCalls)
+			}
+		})
+	}
+}
+
 func TestSSMProxyCancellationWithResponseAndErrorTerminatesCapturedSessionID(t *testing.T) {
 	plugin := testSSMProxyPlugin(t, "exit 99")
 	startIssued := make(chan struct{})

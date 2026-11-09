@@ -30,10 +30,19 @@ func installProxyStatusFakeSSH(t *testing.T, proxyBody, sshMode string) (SSHTarg
 	sshScript := `#!/bin/sh
 set -eu
 proxy=
+remote=
 for arg in "$@"; do
+  remote=$arg
   case "$arg" in ProxyCommand=*) proxy=${arg#ProxyCommand=} ;; esac
 done
 [ -n "$proxy" ]
+if [ -n "${CRABBOX_TEST_PROXY_READY_COMMAND:-}" ] && [ "$remote" != "$CRABBOX_TEST_PROXY_READY_COMMAND" ]; then
+  status=$CRABBOX_INTERNAL_PROXY_STATUS_DIR
+  printf started > "$status/started"
+  printf 'ok\n' > "$status/.result"
+  mv "$status/.result" "$status/result"
+  exit 255
+fi
 sh -c "exec $proxy" &
 proxy_pid=$!
 while [ ! -f "$CRABBOX_INTERNAL_PROXY_STATUS_DIR/started" ]; do sleep 0.01; done
@@ -118,7 +127,10 @@ while :; do sleep 1; done
 	started := time.Now()
 	err := executePreparedSSH(t.Context(), &target, "true", nil, 0, sshCommandLimit{}, "10", "1", io.Discard, io.Discard)
 	duration := time.Since(started)
-	if err == nil || !strings.Contains(err.Error(), "grace period expired") {
+	// A force-killed helper cannot publish its receipt. Assert the safe,
+	// fatal cleanup outcome rather than the superseded raw diagnostic.
+	var statusErr *proxyCommandStatusError
+	if !errors.As(err, &statusErr) || statusErr.class != proxyCommandFailureLifecycleCleanup || statusErr.code != "result_missing" || !statusErr.readinessFatal() {
 		t.Fatalf("error=%v", err)
 	}
 	if duration < proxyCommandStatusGrace || duration > proxyCommandStatusGrace+2*time.Second {
@@ -203,6 +215,38 @@ while :; do sleep 1; done
 	}
 	if strings.Contains(err.Error(), "class=lifecycle_cleanup") {
 		t.Fatalf("successful cleanup poisoned readiness retry: %v", err)
+	}
+	assertProxyStatusTempClean(t, tempDir)
+}
+
+func TestProxyReadinessRetriesRejectedStartUntilSuccessfulProbe(t *testing.T) {
+	t.Setenv("CRABBOX_TEST_PROXY_READY_COMMAND", "fixture-ready")
+	callsPath := filepath.Join(t.TempDir(), "proxy-calls")
+	target, tempDir := installProxyStatusFakeSSH(t, `
+status=$CRABBOX_INTERNAL_PROXY_STATUS_DIR
+call=1
+[ ! -f "`+callsPath+`" ] || call=$(($(wc -l < "`+callsPath+`") + 1))
+printf '%s\n' "$call" >> "`+callsPath+`"
+printf started > "$status/started"
+if [ "$call" -le 3 ]; then
+  printf 'error: start SSM session: AWS API error TargetNotConnected\nSSM session start was rejected before a session was created\n' > "$status/.result"
+  mv "$status/.result" "$status/result"
+  exit 255
+fi
+trap 'printf "TerminateSession\n" >> "`+callsPath+`"; printf "ok\n" > "$status/.result"; mv "$status/.result" "$status/result"; exit 0' TERM
+while :; do sleep 1; done
+`, "exit")
+	target.ReadyCheck = "fixture-ready"
+	var progress bytes.Buffer
+	if err := waitForSSHReady(t.Context(), &target, &progress, "bootstrap", 5*time.Second); err != nil {
+		t.Fatalf("readiness=%v progress=%s", err, progress.String())
+	}
+	calls, err := os.ReadFile(callsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(calls) != "1\n2\n3\n4\nTerminateSession\n" {
+		t.Fatalf("calls=%q", calls)
 	}
 	assertProxyStatusTempClean(t, tempDir)
 }
@@ -346,7 +390,10 @@ func TestProxyCommandStatusErrorUsesOnlySafeClasses(t *testing.T) {
 		{result: "terminate owned SSM session: AWS API error AccessDeniedException private-detail", class: proxyCommandFailureLifecycleCleanup, code: "AccessDeniedException", fatal: true},
 		{result: "terminate owned SSM session: context deadline exceeded private-detail", class: proxyCommandFailureLifecycleCleanup, code: "deadline_exceeded", fatal: true},
 		{result: "start SSM session: AWS API error AccessDeniedException\nSSM session start outcome is unknown because no session ID was returned", class: proxyCommandFailurePermissionDenied, code: "AccessDeniedException", fatal: true},
-		{result: "SSM session start outcome is unknown because no session ID was returned", class: proxyCommandFailureUnknownOutcome, fatal: true},
+		{result: "start SSM session: AWS API error ValidationException\nSSM session start was rejected before a session was created", class: proxyCommandFailureAPIRejected, code: "ValidationException", fatal: true},
+		{result: "start SSM session: AWS API error TargetNotConnected\nSSM session start was rejected before a session was created", class: proxyCommandFailureLifecycle, code: "TargetNotConnected", fatal: false},
+		{result: "start SSM session: AWS API error InternalServerError\nSSM session start outcome is unknown because no session ID was returned", class: proxyCommandFailureUnknownOutcome, code: "InternalServerError", fatal: true},
+		{result: "SSM session start outcome is unknown because no session ID was returned", class: proxyCommandFailureUnknownOutcome, code: "failed", fatal: true},
 		{result: "private arbitrary helper failure", class: proxyCommandFailureLifecycle},
 	} {
 		err := classifyProxyCommandStatusError(test.result)
