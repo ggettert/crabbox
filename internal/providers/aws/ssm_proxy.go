@@ -10,11 +10,13 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	awsdk "github.com/aws/aws-sdk-go-v2/aws"
@@ -28,6 +30,7 @@ const (
 	awsSSMProxyDocument      = "AWS-StartSSHSession"
 	awsSSMProxyResponseEnv   = "AWS_SSM_START_SESSION_RESPONSE"
 	awsSSMProxyDiagnosticMax = 64 * 1024
+	awsSSMProxyHangupSignal  = syscall.Signal(1)
 )
 
 var (
@@ -57,6 +60,8 @@ type ssmProxyLifecycleReporter struct {
 }
 
 func RunSSMProxyCLI(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	ctx, stop := signal.NotifyContext(ctx, awsSSMProxyHangupSignal)
+	defer stop()
 	opts, err := parseSSMProxyOptions(args)
 	if err != nil {
 		return core.Exit(2, "%v", err)

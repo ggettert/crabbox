@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -11,8 +12,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -21,6 +24,19 @@ import (
 
 const awsSSMProxyMainHelperEnvironment = "CRABBOX_TEST_AWS_SSM_PROXY_MAIN_HELPER"
 const awsSSMProxyMainPluginEnvironment = "CRABBOX_TEST_AWS_SSM_PROXY_PLUGIN"
+const awsSSMProxyMainPluginPIDEnvironment = "CRABBOX_TEST_AWS_SSM_PROXY_PLUGIN_PID"
+
+func TestAWSOwnedSSMProxyBlockingPlugin(t *testing.T) {
+	pidPath := os.Getenv(awsSSMProxyMainPluginPIDEnvironment)
+	if pidPath == "" {
+		return
+	}
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.WriteString(os.Stdout, "READY\n")
+	select {}
+}
 
 func TestAWSOwnedSSMProxyHiddenMain(t *testing.T) {
 	if os.Getenv(awsSSMProxyMainHelperEnvironment) == "1" {
@@ -133,6 +149,150 @@ func TestAWSOwnedSSMProxyHiddenMain(t *testing.T) {
 	result, err := os.ReadFile(filepath.Join(statusDir, "result"))
 	if err != nil || string(result) != "ok\n" {
 		t.Fatalf("lifecycle result=%q err=%v", result, err)
+	}
+}
+
+func TestAWSOwnedSSMProxyHiddenMainSignalsCloseSession(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("POSIX signal fixture")
+	}
+	for _, testCase := range []struct {
+		name   string
+		signal os.Signal
+	}{
+		{name: "hangup", signal: syscall.Signal(1)},
+		{name: "terminate", signal: syscall.SIGTERM},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			type request struct {
+				target    string
+				sessionID string
+			}
+			var mu sync.Mutex
+			var requests []request
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Error(err)
+					http.Error(w, "read", http.StatusInternalServerError)
+					return
+				}
+				w.Header().Set("Content-Type", "application/x-amz-json-1.1")
+				switch r.Header.Get("X-Amz-Target") {
+				case "AmazonSSM.StartSession":
+					var input struct {
+						Target string `json:"Target"`
+					}
+					if err := json.Unmarshal(body, &input); err != nil {
+						t.Error(err)
+						http.Error(w, "decode", http.StatusBadRequest)
+						return
+					}
+					mu.Lock()
+					requests = append(requests, request{target: input.Target})
+					mu.Unlock()
+					_, _ = io.WriteString(w, `{"SessionId":"session-signal","TokenValue":"signal-secret-token","StreamUrl":"wss://fixture.invalid/signal-secret-stream"}`)
+				case "AmazonSSM.TerminateSession":
+					var input struct {
+						SessionID string `json:"SessionId"`
+					}
+					if err := json.Unmarshal(body, &input); err != nil {
+						t.Error(err)
+						http.Error(w, "decode", http.StatusBadRequest)
+						return
+					}
+					mu.Lock()
+					requests = append(requests, request{sessionID: input.SessionID})
+					mu.Unlock()
+					_, _ = io.WriteString(w, `{"SessionId":"session-signal"}`)
+				default:
+					t.Errorf("unexpected target %q", r.Header.Get("X-Amz-Target"))
+					http.Error(w, "unexpected", http.StatusBadRequest)
+				}
+			}))
+			defer server.Close()
+
+			dir := t.TempDir()
+			statusDir := filepath.Join(dir, "status")
+			if err := os.Mkdir(statusDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			pluginPIDPath := filepath.Join(dir, "plugin-pid")
+			plugin := filepath.Join(dir, "session-manager-plugin")
+			pluginScript := "#!/bin/sh\nexec " + shellQuoteTest(os.Args[0]) + " -test.run=^TestAWSOwnedSSMProxyBlockingPlugin$\n"
+			if err := os.WriteFile(plugin, []byte(pluginScript), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(os.Args[0], "-test.run=^TestAWSOwnedSSMProxyHiddenMain$")
+			cmd.Env = append(os.Environ(),
+				awsSSMProxyMainHelperEnvironment+"=1",
+				awsSSMProxyMainPluginEnvironment+"="+plugin,
+				awsSSMProxyMainPluginPIDEnvironment+"="+pluginPIDPath,
+				cli.ProxyCommandStatusEnvironment+"="+statusDir,
+				"AWS_ENDPOINT_URL_SSM="+server.URL,
+				"AWS_ACCESS_KEY_ID=fixture-access-key",
+				"AWS_SECRET_ACCESS_KEY=fixture-secret-key",
+				"AWS_EC2_METADATA_DISABLED=true",
+			)
+			stdout, err := cmd.StdoutPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			ready := make(chan string, 1)
+			go func() {
+				line, _ := bufio.NewReader(stdout).ReadString('\n')
+				ready <- line
+			}()
+			select {
+			case line := <-ready:
+				if line != "READY\n" {
+					t.Fatalf("plugin readiness=%q", line)
+				}
+			case <-time.After(10 * time.Second):
+				_ = cmd.Process.Kill()
+				t.Fatal("timed out waiting for plugin readiness")
+			}
+			if err := cmd.Process.Signal(testCase.signal); err != nil {
+				_ = cmd.Process.Kill()
+				t.Fatal(err)
+			}
+			err = cmd.Wait()
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+				t.Fatalf("hidden helper exit=%v stderr=%s", err, stderr.String())
+			}
+
+			mu.Lock()
+			got := append([]request(nil), requests...)
+			mu.Unlock()
+			if len(got) != 2 || got[0].target != "i-0123456789abcdef0" || got[1].sessionID != "session-signal" {
+				t.Fatalf("SDK calls=%+v, want exactly one start then one terminate", got)
+			}
+			result, err := os.ReadFile(filepath.Join(statusDir, "result"))
+			if err != nil || string(result) != "ok\n" {
+				t.Fatalf("lifecycle result=%q err=%v", result, err)
+			}
+			pidBytes, err := os.ReadFile(pluginPIDPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pluginPID, err := strconv.Atoi(string(pidBytes))
+			if err != nil {
+				t.Fatal(err)
+			}
+			pluginProcess, err := os.FindProcess(pluginPID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := pluginProcess.Signal(syscall.Signal(0)); err == nil {
+				t.Fatalf("plugin process %d is still running", pluginPID)
+			}
+		})
 	}
 }
 
