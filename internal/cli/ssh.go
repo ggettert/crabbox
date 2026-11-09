@@ -418,6 +418,7 @@ func waitForSSHReadyWithProbeContext(ctx, probeCtx context.Context, target *SSHT
 	// reachability and authentication. Recording that keeps a readiness-only
 	// failure from being reported as an unknown-authentication timeout.
 	authenticated := false
+	lastFailure := sshReadinessFailureClass("")
 	retryDelay := 250 * time.Millisecond
 	check := func(probeErr error) error {
 		if stopped := sshReadinessProbeContextError(ctx, lastProbe); stopped != nil {
@@ -436,7 +437,11 @@ func waitForSSHReadyWithProbeContext(ctx, probeCtx context.Context, target *SSHT
 			if authenticated {
 				authentication = "ok"
 			}
-			return Exit(5, "timed out waiting for SSH on %s during %s probe=%s cause=deadline_exceeded authentication=%s%s; %s", target.Host, phase, lastProbe, authentication, ports, sshWaitNextAction(phase))
+			failure := ""
+			if lastFailure != "" {
+				failure = " failure=" + string(lastFailure)
+			}
+			return Exit(5, "timed out waiting for SSH on %s during %s probe=%s cause=deadline_exceeded authentication=%s%s%s; %s", target.Host, phase, lastProbe, authentication, failure, ports, sshWaitNextAction(phase))
 		}
 		return nil
 	}
@@ -464,6 +469,9 @@ func waitForSSHReadyWithProbeContext(ctx, probeCtx context.Context, target *SSHT
 		} else if usesSSHProxyTransport(*target) {
 			lastProbe = "readiness"
 			err := probeProxySSHReady(probeCtx, target, profile)
+			if classified := sshReadinessFailure(err); classified != nil {
+				lastFailure = classified.class
+			}
 			if stopped := check(err); stopped != nil {
 				return stopped
 			}
@@ -484,6 +492,9 @@ func waitForSSHReadyWithProbeContext(ctx, probeCtx context.Context, target *SSHT
 				return err
 			}
 			if transportErr := runSSHReadinessProbe(probeCtx, *target, sshTransportProbeCommand(*target), profile.connectTimeout, profile.connectionAttempts); transportErr != nil {
+				if classified := sshReadinessFailure(transportErr); classified != nil {
+					lastFailure = classified.class
+				}
 				if stopped := check(transportErr); stopped != nil {
 					return stopped
 				}
@@ -650,21 +661,26 @@ func sshWaitProgressMessage(target *SSHTarget, phase, reachablePort, transportPo
 }
 
 func ProbeSSHReady(ctx context.Context, target *SSHTarget, timeout time.Duration) bool {
+	return probeSSHReady(ctx, target, timeout) == nil
+}
+
+func probeSSHReady(ctx context.Context, target *SSHTarget, timeout time.Duration) error {
 	if target.Host == "" {
-		return false
+		return errors.New("SSH target host is empty")
 	}
 	profile := sshReadinessProfileForTarget(*target)
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	if isWindowsWSL2Target(*target) {
-		return probeWSL2SSHReady(ctx, target, profile, io.Discard) == nil
+		return probeWSL2SSHReady(ctx, target, profile, io.Discard)
 	}
 	if usesSSHProxyTransport(*target) {
-		return probeProxySSHReady(ctx, target, profile) == nil
+		return probeProxySSHReady(ctx, target, profile)
 	}
+	var lastErr error
 	for _, port := range sshPortCandidates(target.Port, target.FallbackPorts) {
-		if sshReadinessProbeContextError(ctx, "transport") != nil {
-			return false
+		if stopped := sshReadinessProbeContextError(ctx, "transport"); stopped != nil {
+			return stopped
 		}
 		probe := *target
 		probe.Port = port
@@ -672,18 +688,23 @@ func ProbeSSHReady(ctx context.Context, target *SSHTarget, timeout time.Duration
 		dialer := net.Dialer{Timeout: minDuration(timeout, 2*time.Second)}
 		conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(probe.Host, probe.Port))
 		if err != nil {
+			lastErr = err
 			continue
 		}
 		_ = conn.Close()
-		if sshReadinessProbeContextError(ctx, "readiness") != nil {
-			return false
+		if stopped := sshReadinessProbeContextError(ctx, "readiness"); stopped != nil {
+			return stopped
 		}
-		if runSSHQuietWithOptions(ctx, probe, sshReadyCommand(probe), profile.connectTimeout, profile.connectionAttempts) == nil {
+		lastErr = runSSHReadinessProbe(ctx, probe, sshReadyCommand(probe), profile.connectTimeout, profile.connectionAttempts)
+		if lastErr == nil {
 			target.recordPreparedEndpoint(probe.Port)
-			return true
+			return nil
+		}
+		if errors.Is(lastErr, errSSHHostKeyVerification) {
+			return lastErr
 		}
 	}
-	return false
+	return lastErr
 }
 
 func probeProxySSHReady(ctx context.Context, target *SSHTarget, profile sshReadinessProfile) error {
@@ -702,7 +723,8 @@ func probeProxySSHReady(ctx context.Context, target *SSHTarget, profile sshReadi
 				return stopped
 			}
 			var setupErr *workspaceOwnerSetupError
-			if errors.As(lastErr, &setupErr) || errors.Is(lastErr, errSSHHostKeyVerification) {
+			classified := sshReadinessFailure(lastErr)
+			if errors.As(lastErr, &setupErr) || errors.Is(lastErr, errSSHHostKeyVerification) || classified != nil && classified.fatal {
 				return lastErr
 			}
 			continue
@@ -755,7 +777,7 @@ func probeWSL2SSHReady(ctx context.Context, target *SSHTarget, profile sshReadin
 			diagnosticOutput = io.MultiWriter(&diagnostic, stderr)
 		}
 		sftpErr := probeWSLSFTPSubsystem(ctx, probe, profile.connectTimeout, profile.connectionAttempts, diagnosticOutput)
-		if err := sshReadinessProbeError(ctx, sftpErr, diagnostic.hostKeyRejected()); err != nil {
+		if err := sshReadinessProbeError(ctx, sftpErr, diagnostic.failureClass(), usesSSHProxyTransport(probe)); err != nil {
 			if stopped := sshReadinessProbeContextError(ctx, "transport"); stopped != nil {
 				return stopped
 			}

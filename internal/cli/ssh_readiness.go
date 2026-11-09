@@ -36,53 +36,139 @@ var errSSHHostKeyVerification = errors.New("SSH host-key verification failed; ve
 
 const sshHostKeyVerificationDiagnostic = "Host key verification failed."
 
-var sshHostKeyVerificationPrefixes = func() [len(sshHostKeyVerificationDiagnostic)]int {
-	var prefixes [len(sshHostKeyVerificationDiagnostic)]int
-	for i, matched := 1, 0; i < len(prefixes); i++ {
-		for matched > 0 && sshHostKeyVerificationDiagnostic[i] != sshHostKeyVerificationDiagnostic[matched] {
+type sshReadinessFailureClass string
+
+const (
+	sshReadinessFailureUnknown          sshReadinessFailureClass = "unknown"
+	sshReadinessFailurePlugin           sshReadinessFailureClass = "plugin"
+	sshReadinessFailureDataChannel      sshReadinessFailureClass = "data_channel"
+	sshReadinessFailureIdentification   sshReadinessFailureClass = "ssh_identification"
+	sshReadinessFailureAuthentication   sshReadinessFailureClass = "ssh_authentication"
+	sshReadinessFailureHostKey          sshReadinessFailureClass = "host_key_verification"
+	sshReadinessFailureTimeout          sshReadinessFailureClass = "timeout"
+	sshReadinessFailureLifecycle        sshReadinessFailureClass = "lifecycle"
+	sshReadinessFailureLifecycleCleanup sshReadinessFailureClass = "lifecycle_cleanup"
+	sshReadinessFailureUnknownOutcome   sshReadinessFailureClass = "unknown_session_outcome"
+	sshReadinessFailurePermissionDenied sshReadinessFailureClass = "api_permission_denied"
+)
+
+type sshReadinessDiagnosticMatcher struct {
+	pattern  string
+	prefixes []int
+	matched  int
+	seen     bool
+}
+
+func newSSHReadinessDiagnosticMatcher(pattern string) sshReadinessDiagnosticMatcher {
+	prefixes := make([]int, len(pattern))
+	for index, matched := 1, 0; index < len(pattern); index++ {
+		for matched > 0 && pattern[index] != pattern[matched] {
 			matched = prefixes[matched-1]
 		}
-		if sshHostKeyVerificationDiagnostic[i] == sshHostKeyVerificationDiagnostic[matched] {
+		if pattern[index] == pattern[matched] {
 			matched++
 		}
-		prefixes[i] = matched
+		prefixes[index] = matched
 	}
-	return prefixes
-}()
+	return sshReadinessDiagnosticMatcher{pattern: pattern, prefixes: prefixes}
+}
+
+func (m *sshReadinessDiagnosticMatcher) writeByte(value byte) {
+	if m.seen {
+		return
+	}
+	for m.matched > 0 && value != m.pattern[m.matched] {
+		m.matched = m.prefixes[m.matched-1]
+	}
+	if value == m.pattern[m.matched] {
+		m.matched++
+	}
+	if m.matched == len(m.pattern) {
+		m.seen = true
+	}
+}
 
 // Retain only matching state, never stderr bytes. Matching survives arbitrary
 // write boundaries and output volume without weakening bounded-buffer semantics.
 type sshReadinessDiagnostic struct {
 	mu       sync.Mutex
-	matched  int
-	rejected bool
+	matchers []sshReadinessDiagnosticMatcher
+}
+
+func (d *sshReadinessDiagnostic) initialize() {
+	if d.matchers != nil {
+		return
+	}
+	for _, pattern := range []string{
+		sshHostKeyVerificationDiagnostic,
+		"Permission denied (publickey",
+		"Connection timed out during banner exchange",
+		"kex_exchange_identification:",
+		"failed to open data channel",
+		"Session Manager plugin",
+		"context deadline exceeded",
+	} {
+		d.matchers = append(d.matchers, newSSHReadinessDiagnosticMatcher(pattern))
+	}
 }
 
 func (d *sshReadinessDiagnostic) Write(data []byte) (int, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if !d.rejected {
-		for _, b := range data {
-			for d.matched > 0 && b != sshHostKeyVerificationDiagnostic[d.matched] {
-				d.matched = sshHostKeyVerificationPrefixes[d.matched-1]
-			}
-			if b == sshHostKeyVerificationDiagnostic[d.matched] {
-				d.matched++
-			}
-			if d.matched == len(sshHostKeyVerificationDiagnostic) {
-				d.rejected = true
-				break
-			}
+	d.initialize()
+	for _, value := range data {
+		for index := range d.matchers {
+			d.matchers[index].writeByte(value)
 		}
 	}
 	return len(data), nil
 }
 
 func (d *sshReadinessDiagnostic) hostKeyRejected() bool {
+	return d.failureClass() == sshReadinessFailureHostKey
+}
+
+func (d *sshReadinessDiagnostic) failureClass() sshReadinessFailureClass {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.rejected
+	d.initialize()
+	classes := []sshReadinessFailureClass{
+		sshReadinessFailureHostKey,
+		sshReadinessFailureAuthentication,
+		sshReadinessFailureIdentification,
+		sshReadinessFailureIdentification,
+		sshReadinessFailureDataChannel,
+		sshReadinessFailurePlugin,
+		sshReadinessFailureTimeout,
+	}
+	for index, matcher := range d.matchers {
+		if matcher.seen {
+			return classes[index]
+		}
+	}
+	return ""
 }
+
+type sshReadinessClassifiedError struct {
+	class    sshReadinessFailureClass
+	observed sshReadinessFailureClass
+	code     string
+	cause    error
+	fatal    bool
+}
+
+func (e *sshReadinessClassifiedError) Error() string {
+	message := "SSH readiness failed class=" + string(e.class)
+	if e.code != "" {
+		message += " code=" + e.code
+	}
+	if e.observed != "" && e.observed != e.class {
+		message += " observed=" + string(e.observed)
+	}
+	return message
+}
+
+func (e *sshReadinessClassifiedError) Unwrap() error { return e.cause }
 
 func runSSHReadinessProbe(ctx context.Context, target SSHTarget, remote, connectTimeout, attempts string) error {
 	var diagnostic sshReadinessDiagnostic
@@ -94,7 +180,7 @@ func runSSHReadinessProbe(ctx context.Context, target SSHTarget, remote, connect
 	if err == nil {
 		recordCreationObservation(ctx, "ssh_authenticated")
 	}
-	return sshReadinessProbeError(ctx, err, diagnostic.hostKeyRejected())
+	return sshReadinessProbeError(ctx, err, diagnostic.failureClass(), usesSSHProxyTransport(target))
 }
 
 func canWaitForLinuxReadiness(target SSHTarget) bool {
@@ -143,21 +229,71 @@ func runWSLReadinessTransport(ctx context.Context, target SSHTarget, command, co
 	if err == nil {
 		err = context.Cause(ctx)
 	}
-	return sshReadinessProbeError(ctx, err, diagnostic.hostKeyRejected())
+	return sshReadinessProbeError(ctx, err, diagnostic.failureClass(), usesSSHProxyTransport(target))
 }
 
-func sshReadinessProbeError(ctx context.Context, err error, hostKeyRejected bool) error {
+func sshReadinessProbeError(ctx context.Context, err error, class sshReadinessFailureClass, proxy bool) error {
+	if err == nil {
+		return nil
+	}
+	var statusErr *proxyCommandStatusError
+	if errors.As(err, &statusErr) {
+		if statusErr.readinessFatal() {
+			return &sshReadinessClassifiedError{
+				class: sshReadinessClassForProxyFailure(statusErr.class), observed: class,
+				code: statusErr.code, cause: err, fatal: true,
+			}
+		}
+		if class == "" {
+			class = sshReadinessClassForProxyFailure(statusErr.class)
+		}
+		return &sshReadinessClassifiedError{class: class, cause: err}
+	}
 	// A host-key rejection cannot recover while waiting for guest bootstrap.
 	// Retain the exit cause, but never expose captured remote stderr or key data.
-	if ctx.Err() == nil && exitCode(err) == 255 && hostKeyRejected {
+	if ctx.Err() == nil && exitCode(err) == 255 && class == sshReadinessFailureHostKey {
 		return errors.Join(errSSHHostKeyVerification, err)
 	}
+	var setupErr *workspaceOwnerSetupError
+	if errors.As(err, &setupErr) {
+		return err
+	}
+	if proxy {
+		if class == "" {
+			class = sshReadinessFailureUnknown
+		}
+		return &sshReadinessClassifiedError{class: class, cause: err}
+	}
 	return err
+}
+
+func sshReadinessClassForProxyFailure(class proxyCommandFailureClass) sshReadinessFailureClass {
+	switch class {
+	case proxyCommandFailureLifecycleCleanup:
+		return sshReadinessFailureLifecycleCleanup
+	case proxyCommandFailureUnknownOutcome:
+		return sshReadinessFailureUnknownOutcome
+	case proxyCommandFailurePermissionDenied:
+		return sshReadinessFailurePermissionDenied
+	default:
+		return sshReadinessFailureLifecycle
+	}
+}
+
+func sshReadinessFailure(err error) *sshReadinessClassifiedError {
+	var classified *sshReadinessClassifiedError
+	if errors.As(err, &classified) {
+		return classified
+	}
+	return nil
 }
 
 func sshReadinessError(err error, phase string) error {
 	if errors.Is(err, errSSHHostKeyVerification) {
 		return fmt.Errorf("%s: %w", phase, err)
+	}
+	if classified := sshReadinessFailure(err); classified != nil && classified.fatal {
+		return fmt.Errorf("%s: %w", phase, classified)
 	}
 	return workspaceOwnerReadinessError(err, phase)
 }

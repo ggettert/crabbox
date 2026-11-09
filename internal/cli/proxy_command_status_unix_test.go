@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -36,9 +37,10 @@ done
 sh -c "exec $proxy" &
 proxy_pid=$!
 while [ ! -f "$CRABBOX_INTERNAL_PROXY_STATUS_DIR/started" ]; do sleep 0.01; done
-if [ "` + sshMode + `" = exit ]; then
-  exit 0
-fi
+case "` + sshMode + `" in
+  exit) exit 0 ;;
+  fail) exit 255 ;;
+esac
 wait "$proxy_pid"
 `
 	if err := os.WriteFile(ssh, []byte(sshScript), 0o700); err != nil {
@@ -178,6 +180,143 @@ while :; do sleep 1; done
 	assertProxyStatusTempClean(t, tempDir)
 }
 
+func TestProxyReadinessRetriesTransientSSHFailureAfterConfirmedCleanup(t *testing.T) {
+	callsPath := filepath.Join(t.TempDir(), "proxy-calls")
+	target, tempDir := installProxyStatusFakeSSH(t, `
+status=$CRABBOX_INTERNAL_PROXY_STATUS_DIR
+printf call >> "`+callsPath+`"
+printf started > "$status/started"
+trap 'printf "ok\n" > "$status/.result"; mv "$status/.result" "$status/result"; exit 0' TERM
+while :; do sleep 1; done
+`, "fail")
+	var progress bytes.Buffer
+	err := waitForSSHReady(t.Context(), &target, &progress, "bootstrap", 700*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "timed out waiting for SSH") {
+		t.Fatalf("readiness error=%v progress=%s", err, progress.String())
+	}
+	calls, readErr := os.ReadFile(callsPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(calls) < 2 {
+		t.Fatalf("proxy calls=%d, want retry after confirmed cleanup", len(calls))
+	}
+	if strings.Contains(err.Error(), "class=lifecycle_cleanup") {
+		t.Fatalf("successful cleanup poisoned readiness retry: %v", err)
+	}
+	assertProxyStatusTempClean(t, tempDir)
+}
+
+func TestProxyReadinessStartedHelperWithoutReceiptStopsRetry(t *testing.T) {
+	previousGrace := proxyCommandStatusGrace
+	proxyCommandStatusGrace = 50 * time.Millisecond
+	t.Cleanup(func() { proxyCommandStatusGrace = previousGrace })
+	callsPath := filepath.Join(t.TempDir(), "proxy-calls")
+	target, tempDir := installProxyStatusFakeSSH(t, `
+status=$CRABBOX_INTERNAL_PROXY_STATUS_DIR
+printf call >> "`+callsPath+`"
+printf started > "$status/started"
+exit 0
+`, "fail")
+	var progress bytes.Buffer
+	err := waitForSSHReady(t.Context(), &target, &progress, "bootstrap", time.Second)
+	if err == nil || !strings.Contains(err.Error(), "class=lifecycle_cleanup") || !strings.Contains(err.Error(), "code=result_missing") {
+		t.Fatalf("readiness error=%v progress=%s", err, progress.String())
+	}
+	calls, readErr := os.ReadFile(callsPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(calls) != "call" {
+		t.Fatalf("proxy calls=%q, want exactly one", calls)
+	}
+	if strings.Contains(err.Error(), tempDir) {
+		t.Fatalf("readiness error leaked private status path: %v", err)
+	}
+	assertProxyStatusTempClean(t, tempDir)
+}
+
+func TestWindowsBootstrapStabilityCleanupFailureStopsRetry(t *testing.T) {
+	eventsPath := filepath.Join(t.TempDir(), "ssm-events")
+	target, tempDir := installProxyStatusFakeSSH(t, `
+status=$CRABBOX_INTERNAL_PROXY_STATUS_DIR
+printf 'StartSession\n' >> "`+eventsPath+`"
+printf started > "$status/started"
+trap 'printf "TerminateSession\n" >> "`+eventsPath+`"; printf "error: terminate owned SSM session: AWS API error AccessDeniedException private-detail\n" > "$status/.result"; mv "$status/.result" "$status/result"; exit 0' TERM
+while :; do sleep 1; done
+`, "fail")
+	target.TargetOS = targetWindows
+	target.WindowsMode = windowsModeNormal
+	var progress bytes.Buffer
+	err := waitForWindowsSSHStability(t.Context(), &target, &progress, time.Now().Add(time.Second), time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "class=lifecycle_cleanup") || !strings.Contains(err.Error(), "code=AccessDeniedException") {
+		t.Fatalf("stability error=%v progress=%s", err, progress.String())
+	}
+	events, readErr := os.ReadFile(eventsPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(events) != "StartSession\nTerminateSession\n" {
+		t.Fatalf("SSM events=%q, want one start and one failed terminate", events)
+	}
+	if strings.Contains(err.Error(), "private-detail") || strings.Contains(err.Error(), tempDir) {
+		t.Fatalf("stability error leaked private detail: %v", err)
+	}
+	assertProxyStatusTempClean(t, tempDir)
+}
+
+func TestProxyCommandStatusInvalidResultsUseSafeFatalClasses(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		code string
+		make func(t *testing.T, path string)
+	}{
+		{
+			name: "invalid",
+			code: "invalid_result",
+			make: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte("private invalid lifecycle content"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "unreadable",
+			code: "result_unreadable",
+			make: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			status := &proxyCommandStatus{}
+			command := exec.Command("true")
+			if err := status.prepare(command); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(status.dir, "started"), []byte("started"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			test.make(t, filepath.Join(status.dir, "result"))
+			err := status.wait(false)
+			var statusErr *proxyCommandStatusError
+			if !errors.As(err, &statusErr) || statusErr.class != proxyCommandFailureUnknownOutcome || statusErr.code != test.code || !statusErr.readinessFatal() {
+				t.Fatalf("status error=%v", err)
+			}
+			if strings.Contains(err.Error(), status.dir) || strings.Contains(err.Error(), "private") {
+				t.Fatalf("status error leaked private detail: %v", err)
+			}
+			if err := status.cleanup(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestProxyCommandStatusRequiresReceiptOnlyForNormalCompletion(t *testing.T) {
 	status := &proxyCommandStatus{}
 	command := exec.Command("true")
@@ -187,10 +326,35 @@ func TestProxyCommandStatusRequiresReceiptOnlyForNormalCompletion(t *testing.T) 
 	if err := status.wait(false); err != nil {
 		t.Fatalf("early cancellation without helper start: %v", err)
 	}
-	if err := status.wait(true); err == nil || !strings.Contains(err.Error(), "without reporting") {
+	err := status.wait(true)
+	var statusErr *proxyCommandStatusError
+	if !errors.As(err, &statusErr) || statusErr.class != proxyCommandFailureUnknownOutcome || statusErr.code != "missing_start_marker" || !statusErr.readinessFatal() {
 		t.Fatalf("normal completion error=%v", err)
 	}
 	if err := status.cleanup(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestProxyCommandStatusErrorUsesOnlySafeClasses(t *testing.T) {
+	for _, test := range []struct {
+		result string
+		class  proxyCommandFailureClass
+		code   string
+		fatal  bool
+	}{
+		{result: "terminate owned SSM session: AWS API error AccessDeniedException private-detail", class: proxyCommandFailureLifecycleCleanup, code: "AccessDeniedException", fatal: true},
+		{result: "terminate owned SSM session: context deadline exceeded private-detail", class: proxyCommandFailureLifecycleCleanup, code: "deadline_exceeded", fatal: true},
+		{result: "start SSM session: AWS API error AccessDeniedException\nSSM session start outcome is unknown because no session ID was returned", class: proxyCommandFailurePermissionDenied, code: "AccessDeniedException", fatal: true},
+		{result: "SSM session start outcome is unknown because no session ID was returned", class: proxyCommandFailureUnknownOutcome, fatal: true},
+		{result: "private arbitrary helper failure", class: proxyCommandFailureLifecycle},
+	} {
+		err := classifyProxyCommandStatusError(test.result)
+		if err.class != test.class || err.code != test.code || err.readinessFatal() != test.fatal {
+			t.Errorf("%q: got class=%q code=%q fatal=%t", test.result, err.class, err.code, err.readinessFatal())
+		}
+		if strings.Contains(err.Error(), "private") {
+			t.Errorf("unsafe lifecycle detail retained: %v", err)
+		}
 	}
 }

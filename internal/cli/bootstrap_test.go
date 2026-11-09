@@ -1133,8 +1133,8 @@ func TestWindowsStableSSHProbeUsesWindowsReadinessProfile(t *testing.T) {
 		ReadyCheck:     "true",
 	}
 	// This checks readiness options; deadline enforcement is tested separately.
-	if !probeWindowsSSHStable(t.Context(), &target, time.Now().Add(30*time.Second)) {
-		t.Fatal("stable Windows SSH probe failed with fake ssh")
+	if err := probeWindowsSSHStable(t.Context(), &target, time.Now().Add(30*time.Second)); err != nil {
+		t.Fatalf("stable Windows SSH probe failed with fake ssh: %v", err)
 	}
 	args := readSSHArgsRecorder(t, logPath)
 	assertSSHOption(t, args, "ConnectTimeout", "10")
@@ -1158,7 +1158,7 @@ func TestWindowsStableSSHProbeHonorsBootstrapDeadline(t *testing.T) {
 		ReadyCheck:     "true",
 	}
 	start := time.Now()
-	if probeWindowsSSHStable(context.Background(), &target, time.Now().Add(30*time.Millisecond)) {
+	if err := probeWindowsSSHStable(context.Background(), &target, time.Now().Add(30*time.Millisecond)); err == nil {
 		t.Fatal("stable Windows SSH probe ignored the bootstrap deadline")
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {

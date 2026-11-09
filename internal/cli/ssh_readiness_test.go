@@ -119,7 +119,7 @@ func TestSSHReadinessProbeError(t *testing.T) {
 			}
 			var diagnostic sshReadinessDiagnostic
 			_, _ = io.WriteString(&diagnostic, test.diagnostic)
-			err := sshReadinessProbeError(ctx, cause, diagnostic.hostKeyRejected())
+			err := sshReadinessProbeError(ctx, cause, diagnostic.failureClass(), false)
 			if errors.Is(err, errSSHHostKeyVerification) != test.permanent || !errors.Is(err, cause) {
 				t.Fatalf("incorrect classification or lost cause: %v", err)
 			}
@@ -128,6 +128,34 @@ func TestSSHReadinessProbeError(t *testing.T) {
 			}
 			if !test.permanent && err != cause {
 				t.Fatalf("ordinary probe result changed: %v", err)
+			}
+		})
+	}
+}
+
+func TestSSHReadinessDiagnosticClassifiesWithoutRetainingStderr(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		diagnostic string
+		want       sshReadinessFailureClass
+	}{
+		{name: "plugin", diagnostic: "Session Manager plugin exited with private detail", want: sshReadinessFailurePlugin},
+		{name: "data channel", diagnostic: "failed to open data channel: private detail", want: sshReadinessFailureDataChannel},
+		{name: "identification", diagnostic: "kex_exchange_identification: private detail", want: sshReadinessFailureIdentification},
+		{name: "authentication", diagnostic: "Permission denied (publickey,private-data).", want: sshReadinessFailureAuthentication},
+		{name: "timeout", diagnostic: "context deadline exceeded: private detail", want: sshReadinessFailureTimeout},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var diagnostic sshReadinessDiagnostic
+			for index := range len(test.diagnostic) {
+				_, _ = diagnostic.Write([]byte{test.diagnostic[index]})
+			}
+			if got := diagnostic.failureClass(); got != test.want {
+				t.Fatalf("class=%q, want %q", got, test.want)
+			}
+			err := &sshReadinessClassifiedError{class: diagnostic.failureClass(), cause: errors.New("exit status 255")}
+			if strings.Contains(err.Error(), "private") || !strings.Contains(err.Error(), "class="+string(test.want)) {
+				t.Fatalf("unsafe or missing classification: %v", err)
 			}
 		})
 	}

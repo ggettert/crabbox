@@ -105,8 +105,11 @@ func waitForWindowsBootstrapSSHReady(ctx context.Context, target *SSHTarget, std
 	if err := waitForSSHReady(ctx, target, stderr, "bootstrap", timeout); err != nil {
 		return err
 	}
+	return waitForWindowsSSHStability(ctx, target, stderr, deadline, 10*time.Second)
+}
+
+func waitForWindowsSSHStability(ctx context.Context, target *SSHTarget, stderr io.Writer, deadline time.Time, stableInterval time.Duration) error {
 	const stableProbes = 3
-	const stableInterval = 10 * time.Second
 	stable := 1
 	for stable < stableProbes {
 		if ctx.Err() != nil {
@@ -127,9 +130,11 @@ func waitForWindowsBootstrapSSHReady(ctx context.Context, target *SSHTarget, std
 		if remaining <= 0 {
 			return Exit(5, "timed out waiting for stable Windows SSH on %s during bootstrap; %s", target.Host, sshWaitNextAction("bootstrap"))
 		}
-		if probeWindowsSSHStable(ctx, target, deadline) {
+		if err := probeWindowsSSHStable(ctx, target, deadline); err == nil {
 			stable++
 			continue
+		} else if fatalErr := sshReadinessError(err, "bootstrap"); fatalErr != nil {
+			return fatalErr
 		}
 		fmt.Fprintln(stderr, "Windows bootstrap SSH reached once but is still settling; waiting for stable ready-check")
 		stable = 0
@@ -146,14 +151,14 @@ func waitForWindowsBootstrapSSHReady(ctx context.Context, target *SSHTarget, std
 	return nil
 }
 
-func probeWindowsSSHStable(ctx context.Context, target *SSHTarget, deadline time.Time) bool {
+func probeWindowsSSHStable(ctx context.Context, target *SSHTarget, deadline time.Time) error {
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
-		return false
+		return context.DeadlineExceeded
 	}
 	probeCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
-	return ProbeSSHReady(probeCtx, target, minDuration(30*time.Second, remaining))
+	return probeSSHReady(probeCtx, target, minDuration(30*time.Second, remaining))
 }
 
 func waitForManagedWindowsLoopbackVNC(ctx context.Context, target *SSHTarget, stderr io.Writer, timeout time.Duration) error {

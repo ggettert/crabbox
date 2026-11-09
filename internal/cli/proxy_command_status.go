@@ -19,6 +19,79 @@ type proxyCommandStatus struct {
 	cleanupErr  error
 }
 
+type proxyCommandFailureClass string
+
+const (
+	proxyCommandFailureLifecycle        proxyCommandFailureClass = "lifecycle"
+	proxyCommandFailureLifecycleCleanup proxyCommandFailureClass = "lifecycle_cleanup"
+	proxyCommandFailureUnknownOutcome   proxyCommandFailureClass = "unknown_session_outcome"
+	proxyCommandFailurePermissionDenied proxyCommandFailureClass = "api_permission_denied"
+)
+
+type proxyCommandStatusError struct {
+	class proxyCommandFailureClass
+	code  string
+}
+
+func (e *proxyCommandStatusError) Error() string {
+	message := "SSH proxy failed class=" + string(e.class)
+	if e.code != "" {
+		message += " code=" + e.code
+	}
+	return message
+}
+
+func (e *proxyCommandStatusError) readinessFatal() bool {
+	switch e.class {
+	case proxyCommandFailureLifecycleCleanup, proxyCommandFailureUnknownOutcome, proxyCommandFailurePermissionDenied:
+		return true
+	default:
+		return false
+	}
+}
+
+func classifyProxyCommandStatusError(result string) *proxyCommandStatusError {
+	switch {
+	case strings.Contains(result, "terminate owned SSM session"):
+		return &proxyCommandStatusError{class: proxyCommandFailureLifecycleCleanup, code: safeProxyCommandStatusCode(result)}
+	case strings.Contains(result, "AWS API error AccessDeniedException"):
+		return &proxyCommandStatusError{class: proxyCommandFailurePermissionDenied, code: "AccessDeniedException"}
+	case strings.Contains(result, "SSM session start outcome is unknown"):
+		return &proxyCommandStatusError{class: proxyCommandFailureUnknownOutcome}
+	default:
+		return &proxyCommandStatusError{class: proxyCommandFailureLifecycle}
+	}
+}
+
+func safeProxyCommandStatusCode(result string) string {
+	if strings.Contains(result, "context deadline exceeded") {
+		return "deadline_exceeded"
+	}
+	const marker = "AWS API error "
+	index := strings.Index(result, marker)
+	if index < 0 {
+		return "failed"
+	}
+	code := strings.Fields(result[index+len(marker):])
+	if len(code) == 0 || !isSafeProxyCommandStatusCode(code[0]) {
+		return "failed"
+	}
+	return code[0]
+}
+
+func isSafeProxyCommandStatusCode(code string) bool {
+	if len(code) == 0 || len(code) > 64 {
+		return false
+	}
+	for _, character := range code {
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || character == '.' || character == '_' || character == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 func (s *proxyCommandStatus) prepare(cmd *exec.Cmd) error {
 	if s == nil || s.dir != "" {
 		return nil
@@ -55,7 +128,7 @@ func (s *proxyCommandStatus) wait(requireResult bool) error {
 	}
 	if !s.started() {
 		if requireResult {
-			return errors.New("proxy command exited without reporting lifecycle status")
+			return &proxyCommandStatusError{class: proxyCommandFailureUnknownOutcome, code: "missing_start_marker"}
 		}
 		return nil
 	}
@@ -69,16 +142,16 @@ func (s *proxyCommandStatus) wait(requireResult bool) error {
 			case result == "ok":
 				return nil
 			case strings.HasPrefix(result, "error:"):
-				return errors.New(strings.TrimSpace(strings.TrimPrefix(result, "error:")))
+				return classifyProxyCommandStatusError(strings.TrimSpace(strings.TrimPrefix(result, "error:")))
 			default:
-				return errors.New("proxy command returned an invalid lifecycle result")
+				return &proxyCommandStatusError{class: proxyCommandFailureUnknownOutcome, code: "invalid_result"}
 			}
 		}
 		if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("read proxy command lifecycle result: %w", err)
+			return &proxyCommandStatusError{class: proxyCommandFailureUnknownOutcome, code: "result_unreadable"}
 		}
 		if time.Now().After(deadline) {
-			return errors.New("proxy command did not report lifecycle cleanup before the grace period expired")
+			return &proxyCommandStatusError{class: proxyCommandFailureLifecycleCleanup, code: "result_missing"}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
