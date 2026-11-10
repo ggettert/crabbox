@@ -1009,6 +1009,7 @@ type sshTransportPreparation struct {
 	stage                 *wslStageSpool
 	native                *remoteNativeRuntime
 	nativeNonce           string
+	runOverride           func(context.Context, *SSHTarget, string, string, io.Writer, io.Writer) error
 	// replay borrows a finite input owner; its caller closes it after dispatch.
 	replay *replayableSSHInput
 }
@@ -1093,6 +1094,9 @@ func prepareSSHTransport(ctx context.Context, target SSHTarget, command string, 
 }
 
 func (p *sshTransportPreparation) run(ctx context.Context, target *SSHTarget, connectTimeout, connectionAttempts string, stdout, stderr io.Writer) error {
+	if p.runOverride != nil {
+		return p.runOverride(ctx, target, connectTimeout, connectionAttempts, stdout, stderr)
+	}
 	preparedTarget, err := prepareServeRelayControl(ctx, *target)
 	if err != nil {
 		return err
@@ -1274,13 +1278,23 @@ func executeSSHWithRetirement(ctx context.Context, target *SSHTarget, remote str
 	transport.setupMarker = prepared.setupMarker
 	err = transport.execute(ctx, target, limit, connectTimeout, attempts, stdout, stderr)
 	retirementUnconfirmed = transport.retirementUnconfirmed
-	if err != nil && retirementUnconfirmed && context.Cause(ctx) != nil && owner != nil && !isWindowsNativeTarget(*target) {
-		cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), owner.quiesceTimeout())
-		cancelErr := owner.CancelChild(cancelCtx)
-		cancel()
-		err = errors.Join(context.Cause(ctx), err, cancelErr)
-	}
+	err = finishSSHWorkspaceOwnerCancellation(ctx, *target, owner, err, stderr)
 	return retirementUnconfirmed, err
+}
+
+func finishSSHWorkspaceOwnerCancellation(ctx context.Context, target SSHTarget, owner *workspaceOwner, err error, stderr io.Writer) error {
+	cause := context.Cause(ctx)
+	if cause != nil {
+		traceWorkspaceOwnerCancellation(stderr, "decision cause=%s transport_error=%s owner=%t windows=%t", workspaceOwnerCancellationCauseClass(ctx), workspaceOwnerCancellationErrorClass(err), owner != nil, isWindowsNativeTarget(target))
+	}
+	if err == nil || cause == nil || owner == nil || isWindowsNativeTarget(target) {
+		return err
+	}
+	cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), owner.quiesceTimeout())
+	response, cancelErr := owner.cancelChild(cancelCtx)
+	cancel()
+	traceWorkspaceOwnerCancellation(stderr, "action=cancel_child response=%s error=%s", workspaceOwnerCancellationResponseClass(response), workspaceOwnerCancellationErrorClass(cancelErr))
+	return errors.Join(cause, err, cancelErr)
 }
 
 func executePreparedSSH(ctx context.Context, target *SSHTarget, command string, input io.ReadSeeker, size int64, limit sshCommandLimit, connectTimeout, attempts string, stdout, stderr io.Writer) (err error) {
@@ -1304,6 +1318,9 @@ func (transport *sshTransportPreparation) execute(ctx context.Context, target *S
 		defer cancel()
 	}
 	err = transport.run(ctx, target, connectTimeout, attempts, stdout, stderr)
+	if context.Cause(ctx) != nil {
+		traceWorkspaceOwnerCancellation(stderr, "transport_return cause=%s raw_error=%s", workspaceOwnerCancellationCauseClass(ctx), workspaceOwnerCancellationErrorClass(err))
+	}
 	if err == nil {
 		err = context.Cause(ctx)
 	}
@@ -1416,6 +1433,13 @@ func runSSHStreamResult(ctx context.Context, target SSHTarget, remote string, st
 	var preparation sshPreparationError
 	if errors.As(err, &preparation) {
 		return 7, err
+	}
+	if context.Cause(ctx) != nil {
+		var exit ExitError
+		if AsExitError(err, &exit) && exit.Code == 7 {
+			return 7, err
+		}
+		return 1, err
 	}
 	code = exitCode(err)
 	// SSH stream results enter terminal receipts, which require a nonnegative
@@ -3492,4 +3516,48 @@ for file in "$meta_dir/sync-manifest" "$meta_dir/sync-manifest.` + token + `.new
 done
 `
 	return remotePruneSafeSyncManifest(workdir, token, metadata, allowMassDeletions)
+}
+
+const workspaceOwnerCancellationTraceEnvironment = "CRABBOX_INTERNAL_CANCELLATION_TRACE"
+
+func workspaceOwnerCancellationCauseClass(ctx context.Context) string {
+	switch {
+	case errors.Is(context.Cause(ctx), context.Canceled):
+		return "canceled"
+	case errors.Is(context.Cause(ctx), context.DeadlineExceeded):
+		return "deadline_exceeded"
+	case context.Cause(ctx) != nil:
+		return "other"
+	default:
+		return "none"
+	}
+}
+
+func workspaceOwnerCancellationErrorClass(err error) string {
+	if err == nil {
+		return "none"
+	}
+	var exit ExitError
+	if AsExitError(err, &exit) {
+		return "exit_" + strconv.Itoa(exit.Code)
+	}
+	return "present"
+}
+
+func workspaceOwnerCancellationResponseClass(response string) string {
+	switch response {
+	case "CANCELED", "MISMATCH", "EXPIRED", "AMBIGUOUS", "CHILD":
+		return response
+	case "":
+		return "none"
+	default:
+		return "other"
+	}
+}
+
+func traceWorkspaceOwnerCancellation(stderr io.Writer, format string, args ...any) {
+	if stderr == nil || os.Getenv(workspaceOwnerCancellationTraceEnvironment) != "1" {
+		return
+	}
+	fmt.Fprintf(stderr, "workspace owner cancellation trace "+format+"\n", args...)
 }

@@ -664,24 +664,29 @@ func finishRsyncWorkspaceWitness(ctx context.Context, target SSHTarget, owner *w
 }
 
 func (o *workspaceOwner) CancelChild(ctx context.Context) error {
+	_, err := o.cancelChild(ctx)
+	return err
+}
+
+func (o *workspaceOwner) cancelChild(ctx context.Context) (string, error) {
 	if o == nil {
-		return nil
+		return "", nil
 	}
 	if isWindowsNativeTarget(o.target) {
-		return Exit(7, "cancel remote workspace owner child failed closed: unsupported target")
+		return "", Exit(7, "cancel remote workspace owner child failed closed: unsupported target")
 	}
 	if err := o.Err(); err != nil {
-		return err
+		return "", err
 	}
 	response, err := callWorkspaceOwnerTransport(ctx, o.callTimeout(), o.transport, workspaceOwnerRemoteRequest{Action: workspaceOwnerCancel, Key: o.key, Token: o.token, TTL: o.ttl})
 	if err != nil {
 		err = workspaceOwnerProtocolError(response, err)
-		return workspaceOwnerCallError("cancel remote workspace owner child", err)
+		return response, workspaceOwnerCallError("cancel remote workspace owner child", err)
 	}
 	if response != "CANCELED" {
-		return Exit(7, "cancel remote workspace owner child failed closed: %s", strings.ToLower(firstNonBlank(response, "ambiguous")))
+		return response, Exit(7, "cancel remote workspace owner child failed closed: %s", strings.ToLower(firstNonBlank(response, "ambiguous")))
 	}
-	return nil
+	return response, nil
 }
 
 func (o *workspaceOwner) Close(ctx context.Context) (err error) {
@@ -1016,7 +1021,7 @@ case "$action" in
       live_pgid=$(ps -o pgid= -p "$child_pid" 2>/dev/null | tr -d ' ')
       live_sid=$(ps -o sid= -p "$child_pid" 2>/dev/null | tr -d ' ')
       [ "$live_start" = "$child_start" ] && [ "$live_pgid" = "$child_pgid" ] && [ "$live_sid" = "$child_sid" ] || { printf AMBIGUOUS; exit 74; }
-      kill -TERM -- "-$child_pgid" 2>/dev/null || { printf AMBIGUOUS; exit 74; }
+      kill -TERM "-$child_pgid" 2>/dev/null || { printf AMBIGUOUS; exit 74; }
       left=20
       while :; do
         if owner_group_status "$child_pgid" "$child_sid"; then group_rc=0; else group_rc=$?; break; fi
@@ -1031,7 +1036,7 @@ case "$action" in
         live_pgid=$(ps -o pgid= -p "$child_pid" 2>/dev/null | tr -d ' ')
         live_sid=$(ps -o sid= -p "$child_pid" 2>/dev/null | tr -d ' ')
         [ "$live_start" = "$child_start" ] && [ "$live_pgid" = "$child_pgid" ] && [ "$live_sid" = "$child_sid" ] || { printf AMBIGUOUS; exit 74; }
-        kill -KILL -- "-$child_pgid" 2>/dev/null || { printf AMBIGUOUS; exit 74; }
+        kill -KILL "-$child_pgid" 2>/dev/null || { printf AMBIGUOUS; exit 74; }
         left=20
         while :; do
           if owner_group_status "$child_pgid" "$child_sid"; then group_rc=0; else group_rc=$?; break; fi

@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -96,6 +97,53 @@ func TestWorkspaceOwnerPOSIXCancelFencesAndQuiescesExactGroup(t *testing.T) {
 	}
 	if _, err := os.Stat(next); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestWorkspaceOwnerPOSIXCancelUsesPortableGroupSignalSyntax(t *testing.T) {
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Skip("setsid is required for dedicated cancellation geometry")
+	}
+	home := t.TempDir()
+	key := "cancel-portable-signal"
+	token := strings.Repeat("d", 64)
+	req := func(action workspaceOwnerAction) workspaceOwnerRemoteRequest {
+		return workspaceOwnerRemoteRequest{Action: action, Key: key, Token: token, TTL: time.Minute}
+	}
+	run := func(script string) (string, error) {
+		cmd := exec.Command("/bin/sh", "-c", script)
+		cmd.Env = append(os.Environ(), "HOME="+home)
+		out, err := cmd.CombinedOutput()
+		return strings.TrimSpace(string(out)), err
+	}
+	if out, err := run(remoteWorkspaceOwnerPOSIX(req(workspaceOwnerAcquire))); err != nil || out != "ACQUIRED" {
+		t.Fatalf("acquire out=%q err=%v", out, err)
+	}
+	started := filepath.Join(home, "STARTED")
+	witness := exec.Command("/bin/sh", "-c", remoteWorkspaceOwnerPOSIXWitness(key, token, "trap '' TERM; printf started > "+shellQuote(started)+"; sleep 30"))
+	witness.Env = append(os.Environ(), "HOME="+home)
+	var witnessOutput bytes.Buffer
+	witness.Stdout, witness.Stderr = &witnessOutput, &witnessOutput
+	if err := witness.Start(); err != nil {
+		t.Fatal(err)
+	}
+	childPath := filepath.Join(home, ".crabbox", "workspace-owners", key+".child")
+	t.Cleanup(func() {
+		if metadata, err := os.ReadFile(childPath); err == nil {
+			fields := strings.Split(strings.TrimSpace(string(metadata)), "\n")
+			if len(fields) == 5 && fields[0] == fields[2] && fields[0] == fields[3] {
+				if pid, err := strconv.Atoi(fields[0]); err == nil {
+					_ = syscall.Kill(-pid, syscall.SIGKILL)
+				}
+			}
+		}
+		_ = witness.Process.Kill()
+		_ = witness.Wait()
+	})
+	waitForWorkspaceOwnerTestFile(t, started)
+	waitForWorkspaceOwnerTestFile(t, childPath)
+	if out, err := run(remoteWorkspaceOwnerPOSIX(req(workspaceOwnerCancel))); err != nil || out != "CANCELED" {
+		t.Fatalf("cancel out=%q err=%v witness=%q", out, err, witnessOutput.String())
 	}
 }
 
@@ -516,6 +564,148 @@ func TestWorkspaceOwnerCancellationOverRealOpenSSHAllowsImmediateReuse(t *testin
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestWorkspaceOwnerCancellationFromCLIProcessAllowsImmediateReuse(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real OpenSSH CLI regression")
+	}
+	target, stop := startWorkspaceOwnerRootlessSSHD(t)
+	defer stop()
+	binary, err := builtCLITestBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	leaseID := "static_cli_cancel_" + strconv.Itoa(os.Getpid()) + "_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	workRoot := filepath.Join(root, "remote-work")
+	baseArgs := []string{
+		"run", "--provider", "ssh", "--target", "linux",
+		"--static-host", target.Host, "--static-user", target.User, "--static-port", target.Port,
+		"--static-work-root", workRoot, "--static-no-control-master",
+		"--no-sync", "--no-hydrate", "--keep",
+	}
+	environment := append(os.Environ(),
+		"HOME="+root,
+		"XDG_CONFIG_HOME="+filepath.Join(root, "config"),
+		"XDG_STATE_HOME="+filepath.Join(root, "state"),
+		"XDG_CACHE_HOME="+filepath.Join(root, "cache"),
+		"CRABBOX_CONFIG="+filepath.Join(root, "missing.yaml"),
+		"CRABBOX_SSH_KEY="+target.Key,
+		"CRABBOX_STATIC_ID="+leaseID,
+	)
+	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
+	defer cancel()
+	stopArgs := []string{
+		"stop", "--provider", "ssh", "--target", "linux",
+		"--static-host", target.Host, "--static-user", target.User, "--static-port", target.Port,
+		"--static-work-root", workRoot, "--static-no-control-master", "--id", leaseID,
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		stopCommand := exec.CommandContext(cleanupCtx, binary, stopArgs...)
+		stopCommand.Env = environment
+		_ = stopCommand.Run()
+	})
+
+	unrelated, err := runSSHOutput(ctx, target, "setsid /bin/sh -c 'exec sleep 30' >/dev/null 2>&1 < /dev/null & printf '%s' $!")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = runSSHQuiet(context.Background(), target, "kill "+unrelated+" 2>/dev/null || true") }()
+
+	args := append(append([]string{}, baseArgs...), "--", "sh", "-lc", `printf 'CLI_CANCEL_STARTED\n'; sleep 30; printf 'CLI_CANCEL_BAD\n'`)
+	command := exec.CommandContext(ctx, binary, args...)
+	command.Env = environment
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(stdout)
+	line, err := reader.ReadString('\n')
+	if err != nil || strings.TrimSpace(line) != "CLI_CANCEL_STARTED" {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatalf("start line=%q err=%v stderr=%q", line, err, stderr.String())
+	}
+
+	ownerKey := workspaceOwnerKey(leaseID)
+	childPath := `"$HOME/.crabbox/workspace-owners/` + ownerKey + `.child"`
+	child, err := runSSHOutput(ctx, target, "cat "+childPath)
+	if err != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatal(err)
+	}
+	metadata := strings.Split(strings.TrimSpace(child), "\n")
+	if len(metadata) != 5 || metadata[0] != metadata[2] || metadata[0] != metadata[3] {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatalf("non-dedicated CLI witness metadata=%q", child)
+	}
+	statePath := `"$HOME/.crabbox/workspace-owners/` + ownerKey + `.owner"`
+	token, err := runSSHOutput(ctx, target, "sed -n '2p' "+statePath)
+	if err != nil || len(strings.TrimSpace(token)) != 64 {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatalf("read exact owner generation: %v", err)
+	}
+	request := func(action workspaceOwnerAction) workspaceOwnerRemoteRequest {
+		return workspaceOwnerRemoteRequest{Action: action, Key: ownerKey, Token: strings.TrimSpace(token), TTL: time.Minute}
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		transport := sshWorkspaceOwnerTransport{target: target}
+		_, _ = transport.Do(cleanupCtx, request(workspaceOwnerCancel))
+		_, _ = transport.Do(cleanupCtx, request(workspaceOwnerRelease))
+	})
+
+	if err := command.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	remaining, readErr := io.ReadAll(reader)
+	waitErr := command.Wait()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	exit := 0
+	if waitErr != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(waitErr, &exitErr) {
+			t.Fatal(waitErr)
+		}
+		exit = exitErr.ExitCode()
+	}
+	if exit != 1 || strings.Contains(string(remaining), "CLI_CANCEL_BAD") || !strings.Contains(stderr.String(), "workspace owner released") {
+		t.Fatalf("cancel exit=%d remaining=%q stderr=%q", exit, remaining, stderr.String())
+	}
+	waitForGroupQuiescence(t, metadata[2], metadata[3])
+	if err := runSSHQuiet(ctx, target, "test ! -e "+childPath); err != nil {
+		t.Fatalf("CLI cancellation retained child witness: %v", err)
+	}
+	if err := runSSHQuiet(ctx, target, "kill -0 "+unrelated); err != nil {
+		t.Fatalf("unrelated remote process did not survive: %v", err)
+	}
+
+	nextArgs := append(append([]string{}, baseArgs...), "--", "printf", "CLI_NEXT_OK\\n")
+	next := exec.CommandContext(ctx, binary, nextArgs...)
+	next.Env = environment
+	nextOutput, err := next.CombinedOutput()
+	if err != nil || !strings.Contains(string(nextOutput), "CLI_NEXT_OK") {
+		t.Fatalf("immediate reuse err=%v output=%q", err, nextOutput)
+	}
+	stopCommand := exec.CommandContext(ctx, binary, stopArgs...)
+	stopCommand.Env = environment
+	if output, err := stopCommand.CombinedOutput(); err != nil {
+		t.Fatalf("static cleanup err=%v output=%q", err, output)
 	}
 }
 
