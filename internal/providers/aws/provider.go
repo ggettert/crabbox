@@ -71,7 +71,14 @@ func (Provider) Spec() core.ProviderSpec {
 	}
 }
 func (Provider) RegisterFlags(*flag.FlagSet, core.Config) any { return core.NoProviderFlags() }
-func (Provider) ApplyFlags(*core.Config, *flag.FlagSet, any) error {
+func (Provider) ApplyFlags(cfg *core.Config, _ *flag.FlagSet, _ any) error {
+	cfg.AWSSSHTransport = strings.ToLower(strings.TrimSpace(cfg.AWSSSHTransport))
+	if cfg.AWSSSHTransport == "" {
+		cfg.AWSSSHTransport = core.AWSSSHTransportDirect
+	}
+	if cfg.AWSSSHTransport != core.AWSSSHTransportDirect && cfg.AWSSSHTransport != core.AWSSSHTransportSSM {
+		return core.Exit(2, "aws sshTransport must be direct or ssm")
+	}
 	return nil
 }
 
@@ -79,6 +86,7 @@ func (Provider) ConfigureSSHTarget(target *core.SSHTarget, readyCommand string) 
 	if target.TargetOS == core.TargetLinux {
 		// The tmpfs marker proves this boot completed bootstrap, including any
 		// optional cloud-final setup. Older guests retain their cloud-init gate.
+		target.ReadinessStatus = awsLinuxReadinessStatus
 		target.ReadyCheck = "if systemctl cat crabbox-workspace-ready.service >/dev/null 2>&1; then test -f /run/crabbox/workspace-ready; else timeout 20m cloud-init status --wait >/tmp/crabbox-cloud-init.log 2>&1; fi && " + readyCommand
 	}
 }

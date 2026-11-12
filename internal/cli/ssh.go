@@ -41,6 +41,11 @@ type SSHJump struct {
 	Fingerprint  string             `json:"fingerprint,omitempty"`
 }
 
+type SSHReadinessErrorPattern struct {
+	Fragment string
+	Message  string
+}
+
 type SSHTarget struct {
 	relayConfig             *Config
 	relayCoordinator        *CoordinatorClient
@@ -59,19 +64,23 @@ type SSHTarget struct {
 	TargetOS                string
 	WindowsMode             string
 	ReadyCheck              string
-	AuthSecret              bool
-	NoControlMaster         bool
-	ownerControlPath        string // Private foreground master with an explicit local lifetime owner.
-	DisableHostKeyChecking  bool
-	NetworkKind             NetworkMode
-	SSHConfigProxy          bool
-	SSHConfigFile           string // Provider-owned IdentitiesOnly route; bypass ambient SSH config.
-	SSHConfigData           []byte `json:"-"` // Captured provider config; keep resolution and transport on the same bytes.
-	ProxyCommand            string
-	ChildEnvDenylist        []string
+	// ReadinessStatus is an optional provider-owned, observational command.
+	// It may report pending/failed phases; it can never establish readiness.
+	ReadinessStatus        string
+	AuthSecret             bool
+	NoControlMaster        bool
+	ownerControlPath       string // Private foreground master with an explicit local lifetime owner.
+	DisableHostKeyChecking bool
+	NetworkKind            NetworkMode
+	SSHConfigProxy         bool
+	SSHConfigFile          string // Provider-owned IdentitiesOnly route; bypass ambient SSH config.
+	SSHConfigData          []byte `json:"-"` // Captured provider config; keep resolution and transport on the same bytes.
+	ProxyCommand           string
+	ChildEnvDenylist       []string
 	// Transport-only overrides can contain credentials; never serialize them.
-	ChildEnv          map[string]string `json:"-"`
-	DiagnosticSecrets []string          `json:"-"` // Provider credentials echoed by local authentication hooks.
+	ChildEnv               map[string]string          `json:"-"`
+	DiagnosticSecrets      []string                   `json:"-"` // Provider credentials echoed by local authentication hooks.
+	ReadinessErrorPatterns []SSHReadinessErrorPattern `json:"-"` // Provider-owned sanitized terminal diagnostics.
 	// Refresh provider-owned credential files before a new transport starts.
 	PrepareConnection func(context.Context) error `json:"-"`
 }
@@ -382,11 +391,22 @@ func waitForSSHReady(ctx context.Context, target *SSHTarget, stderr io.Writer, p
 			return context.Cause(ctx)
 		}
 	}
+	if policy, ok := checkpointReadinessFromContext(ctx); ok {
+		timeout = policy.Timeout
+	}
 	start := time.Now()
-	deadline := time.Now().Add(timeout)
+	deadline := start.Add(timeout)
+	if parentDeadline, ok := ctx.Deadline(); ok && parentDeadline.Before(deadline) {
+		deadline = parentDeadline
+	}
 	probeCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	err := waitForSSHReadyWithProbeContext(ctx, probeCtx, target, stderr, phase, start, deadline)
+	if err != nil && context.Cause(ctx) != nil {
+		if policy, ok := checkpointReadinessFromContext(ctx); ok {
+			return fmt.Errorf("checkpoint readiness stopped lease=%s checkpoint=%s elapsed=%s wait_deadline=%s%s; fixed identity retained, replay the same fork with --lease-id %s: %w", policy.LeaseID, policy.CheckpointID, time.Since(start).Round(time.Second), deadline.UTC().Format(time.RFC3339), policy.lifetimeSummary(), policy.LeaseID, err)
+		}
+	}
 	if cache && err == nil {
 		scope.mu.Lock()
 		if scope.readiness == nil {
@@ -406,6 +426,9 @@ func waitForSSHReadyWithProbeContext(ctx, probeCtx context.Context, target *SSHT
 	// reachability and authentication. Recording that keeps a readiness-only
 	// failure from being reported as an unknown-authentication timeout.
 	authenticated := false
+	blocking := "unknown"
+	policy, checkpointWait := checkpointReadinessFromContext(ctx)
+	statusTarget := *target
 	retryDelay := 250 * time.Millisecond
 	check := func(probeErr error) error {
 		if stopped := sshReadinessProbeContextError(ctx, lastProbe); stopped != nil {
@@ -424,6 +447,13 @@ func waitForSSHReadyWithProbeContext(ctx, probeCtx context.Context, target *SSHT
 			if authenticated {
 				authentication = "ok"
 			}
+			if checkpointWait {
+				state := "transport_failure"
+				if lastProbe == "readiness" && authenticated {
+					state = "pending"
+				}
+				return policy.failure(state, blocking, time.Since(start), deadline)
+			}
 			return Exit(5, "timed out waiting for SSH on %s during %s probe=%s cause=deadline_exceeded authentication=%s%s; %s", target.Host, phase, lastProbe, authentication, ports, sshWaitNextAction(phase))
 		}
 		return nil
@@ -431,6 +461,19 @@ func waitForSSHReadyWithProbeContext(ctx, probeCtx context.Context, target *SSHT
 	for {
 		if err := check(nil); err != nil {
 			return err
+		}
+		if checkpointWait && target.ReadinessStatus != "" {
+			status, stage := observeReadinessStatus(probeCtx, statusTarget)
+			if err := check(nil); err != nil {
+				return err
+			}
+			if status != "" {
+				blocking = stage
+				if status == "failed" {
+					return policy.failure("bootstrap_failed", blocking, time.Since(start), deadline)
+				}
+				fmt.Fprintf(stderr, "provisioning lease=%s state=pending phase=%s elapsed=%s wait_deadline=%s%s\n", policy.LeaseID, blocking, time.Since(start).Round(time.Second), deadline.UTC().Format(time.RFC3339), policy.lifetimeSummary())
+			}
 		}
 		if isWindowsWSL2Target(*target) {
 			lastProbe = "transport"
@@ -552,6 +595,10 @@ func waitForSSHReadyWithProbeContext(ctx, probeCtx context.Context, target *SSHT
 				// stage rather than the probe that just succeeded.
 				authenticated = true
 				lastProbe = "readiness"
+				// Observe the route that just proved transport, without admitting
+				// the target as ready or changing the normal port selection.
+				statusTarget.Port = probe.Port
+				statusTarget.FallbackPorts = []string{}
 				probes = append(probes, port+":ready")
 				if canWaitForLinuxReadiness(probe) {
 					lastPorts = strings.Join(probes, ",")
@@ -737,13 +784,13 @@ func probeWSL2SSHReady(ctx context.Context, target *SSHTarget, profile sshReadin
 		if stopped := sshReadinessProbeContextError(ctx, "transport"); stopped != nil {
 			return stopped
 		}
-		var diagnostic sshReadinessDiagnostic
-		var diagnosticOutput io.Writer = &diagnostic
+		diagnostic := newSSHReadinessDiagnostic(probe)
+		var diagnosticOutput io.Writer = diagnostic
 		if stderr != nil {
-			diagnosticOutput = io.MultiWriter(&diagnostic, stderr)
+			diagnosticOutput = io.MultiWriter(diagnostic, stderr)
 		}
 		sftpErr := probeWSLSFTPSubsystem(ctx, probe, profile.connectTimeout, profile.connectionAttempts, diagnosticOutput)
-		if err := sshReadinessProbeError(ctx, sftpErr, diagnostic.hostKeyRejected()); err != nil {
+		if err := sshReadinessProbeError(ctx, sftpErr, diagnostic); err != nil {
 			if stopped := sshReadinessProbeContextError(ctx, "transport"); stopped != nil {
 				return stopped
 			}

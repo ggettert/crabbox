@@ -385,8 +385,10 @@ interruption or attempted submission without a returned image identity remains
 unresolved; this does not unlock historical blank records.
 
 For an ordinary Machine0 record without an image identity, `abandon` can dispose
-of the exact source while retaining the unresolved image obligation. It does not
-prove whether the original image was submitted or whether an image is absent.
+of the exact source while retaining the unresolved image obligation. Direct AWS
+also supports source-only recovery of an existing pre-submit retirement using
+`--pre-submit-error-file`; see [abandon](#abandon) for its narrower requirements.
+Neither path proves whether the original image was submitted or is absent.
 
 Older binaries do not understand these operation holds. Before downgrading,
 stop new capture admission and finish all operations with this binary; do not
@@ -403,9 +405,10 @@ journal; it cannot undo a source deletion performed by an older binary.
 
 ## abandon
 
-Dispose of a source held by an unresolved ordinary native checkpoint. Machine0
-currently supports this recovery; other providers refuse it without changing
-the record or source.
+Dispose of an exact source while retaining its unresolved native image obligation.
+Machine0 supports ordinary unresolved captures without an image identity. Direct
+AWS supports adopting an existing pre-submit retirement as described below, not
+ordinary blank-image records. Coordinator-managed checkpoints are not eligible.
 
 ```sh
 crabbox checkpoint abandon chk_0123456789abcdef \
@@ -419,6 +422,44 @@ changed claim, or other unresolved capture prevents admission. The command
 records separate source-cleanup account evidence before disposing of the VM;
 it never treats that account as proof about the original image submission.
 
+### Pre-submit retirement recovery
+
+`--pre-submit-error-file <path>` permits adoption of an existing retirement with
+`capture.sourceDisposition: retire` and `capture.phase: submitting`, with no
+image/resource/delete identity. It requires the exact current source claim,
+matching checkpoint binding, repository, provider, immutable source ID and name,
+and a provider capability that permits source retirement. Changed ownership or
+another unresolved source checkpoint blocks recovery.
+
+For direct AWS, use the canonical lease ID (not a slug), the exact instance ID,
+and a local file containing the original CLI preparation failure:
+
+```sh
+crabbox checkpoint abandon chk_0123456789abcdef \
+  --provider aws --id cbx_012345abcdef \
+  --expected-provider-resource-id '<exact-instance-id>' \
+  --pre-submit-error-file ./checkpoint-prepare-error.txt --json
+```
+
+The file must be nonempty, at most 64 KiB, contain no NUL bytes, and begin with
+`prepare native checkpoint source:` after trimming whitespace. Crabbox hashes
+its exact bytes with SHA-256 and retains the digest in
+`native.metadata.crabbox_pre_submit_failure_sha256`. This is an audit of
+**operator-supplied evidence, not cryptographic proof of non-submission**; the
+prefix check does not authenticate the diagnostic. Do not fabricate evidence or
+include raw secrets in examples or shared diagnostics. A different evidence hash
+is rejected on replay.
+
+AWS cleanup requires a valid 12-digit account ID and nonempty region in the
+source claim, matching its `account:<id>` scope and any already recorded native
+account/region. These identify source cleanup, not the original image's owner.
+Current AWS caller account, exact instance identity, canonical ownership tags,
+and retained claim/create-intent identity must pass the provider's validation;
+changing credentials/accounts cannot establish absence. Replay with the evidence
+file also requires the retained fixed-create-intent fingerprint, claim timestamp,
+and source scope to match. Preserve these receipts rather than editing them to
+force cleanup.
+
 Replay the same command if source removal is pending or the process was
 interrupted. The retained record reports `capture.phase: abandoned` only after
 exact source absence and claim finalization are verified. Its error text still
@@ -428,7 +469,8 @@ provider operation/account to resolve any image storage obligation. A later
 image observation does not cause this command to adopt or delete the image.
 
 Abandonment never creates another snapshot, starts the source, or deletes an
-image. The record remains unavailable to fork, restore, delete, local-only
+image. Do not blindly retry image creation, delete an uncertain image, or fork it.
+The record remains unavailable to fork, restore, delete, local-only
 delete, and prune, including to older readers that retain unknown capture
 phases. Source-only abandonment does not authorize forgetting the checkpoint.
 
@@ -626,6 +668,7 @@ crabbox checkpoint fork --provider parallels --parallels-template ubuntu-fast --
                   and commands after --.
 --json            Print one fork as a JSON object or multiple forks as a JSON
                   array; incompatible with --dry-run.
+--wait-timeout <duration>  Fixed native Linux readiness wait (default 60m, maximum 4h).
 --id <vm>         Parallels source VM when forking from --snapshot.
 --snapshot <name> Parallels snapshot name or id for a direct fork.
 --clear           Clear the workdir before restoring an archive (default true).
@@ -890,3 +933,51 @@ for consistency, ownership, and cleanup requirements.
 
 Any POSIX SSH-accessible lease (Linux, macOS, or Windows under WSL2). Portable
 across providers. Windows-native (non-WSL2) leases are not supported.
+
+### Continuing a slow fixed native Linux fork
+
+A native Linux fork with `--lease-id` waits up to **60 minutes** for real
+bootstrap readiness. `--wait-timeout <duration>` overrides this invocation's
+wait (greater than zero, at most `4h`); it requires `--lease-id`. It does not
+change the lease TTL, idle timeout, or enforced lifetime policy. Other fork
+modes retain their existing readiness limits and cleanup behavior.
+
+```sh
+crabbox checkpoint fork chk_example --provider aws \
+  --lease-id cbx_012345abcdef --slug test-fork --ttl 4h --idle-timeout 2h \
+  --wait-timeout 60m --json
+```
+
+Progress stays on stderr. On AWS, observations of the existing systemd boot
+owners identify phases such as `ownership-repair`, `bootstrap`, `cloud-final`,
+and `workspace-ready`. Missing diagnostics report an unknown phase. These
+observations never establish readiness: the current-boot marker and the normal
+readiness command must still pass. Elapsed time measures the current wait;
+`wait_deadline` is its effective local deadline. `observed_lease_deadline`, when
+available, is the expiry/policy stop time observed at acquisition, and can move
+as the existing coordinator heartbeat or an explicit extension updates policy.
+The existing live lease watch checks fresh expiry and enforced stop policy.
+Direct AWS acquisition checks its recorded expiry in its existing provider
+monitor. The readiness wait grants no lifetime extension; existing heartbeat
+behavior is unchanged.
+
+A local timeout exits `5` with `state=pending` when authenticated transport
+still works and readiness is outstanding, or `state=transport_failure` when
+the active transport probe cannot finish. An observed failed boot unit exits
+`5` with `state=bootstrap_failed`; investigate that phase before retrying.
+Lifetime exhaustion reports `state=lifetime_exhausted`. Cancellation preserves
+its original cause. Diagnostics retain the canonical lease identity throughout.
+
+For a pending timeout or interrupted wait, repeat **the same command**, with the
+same checkpoint, lease ID, slug, and lease options. The existing fixed acquisition
+reconciles and waits on that instance, then completes workdir relocation and
+normal checkpoint bookkeeping. Only the wait timeout may change. A changed
+intent, missing acquired resource, released lease, or lost authority fails
+closed. No timeout triggers replacement allocation or marks the guest ready.
+Use `inspect --id cbx_012345abcdef --json` for investigation, or explicit `stop`
+for cleanup. A fresh invocation still requires the checkpoint and its existing
+use admission to remain available.
+
+Success JSON is unchanged. A fork still waiting or failing inside acquisition
+emits no success object on stdout and returns a nonzero exit; its identity and
+recovery guidance are on stderr. This also applies with `--json`.

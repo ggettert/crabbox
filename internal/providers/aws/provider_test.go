@@ -16,6 +16,71 @@ import (
 	core "github.com/openclaw/crabbox/internal/cli"
 )
 
+func TestAWSSSHTransportValidation(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		want  string
+		fail  bool
+	}{
+		{value: "", want: core.AWSSSHTransportDirect},
+		{value: " DIRECT ", want: core.AWSSSHTransportDirect},
+		{value: "SSM", want: core.AWSSSHTransportSSM},
+		{value: "custom", fail: true},
+	} {
+		cfg := core.Config{AWSSSHTransport: test.value}
+		err := (Provider{}).ApplyFlags(&cfg, nil, nil)
+		if test.fail {
+			if err == nil {
+				t.Fatalf("transport %q accepted", test.value)
+			}
+			continue
+		}
+		if err != nil || cfg.AWSSSHTransport != test.want {
+			t.Fatalf("transport %q normalized to %q, err=%v", test.value, cfg.AWSSSHTransport, err)
+		}
+	}
+}
+
+func TestAWSSSMTargetUsesDocumentedCLIArgv(t *testing.T) {
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "args")
+	awsPath := filepath.Join(dir, "aws")
+	if err := os.WriteFile(awsPath, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGS_PATH\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("ARGS_PATH", argsPath)
+	region := "region with ' quote"
+	if output, err := exec.Command("sh", "-c", awsSSMProxyCommand(region)).CombinedOutput(); err != nil {
+		t.Fatalf("proxy command: %v: %s", err, output)
+	}
+	data, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Join([]string{
+		"ssm", "start-session",
+		"--target", "%h",
+		"--document-name", "AWS-StartSSHSession",
+		"--parameters", "portNumber=%p",
+		"--region", region,
+	}, "\n") + "\n"
+	if string(data) != want {
+		t.Fatalf("aws argv=%q want=%q", data, want)
+	}
+
+	server := core.Server{CloudID: "i-0123456789abcdef0"}
+	server.PublicNet.IPv4.IP = "203.0.113.10"
+	target := awsSSHTarget(core.Config{Provider: "aws", AWSSSHTransport: core.AWSSSHTransportSSM, AWSRegion: "eu-west-1"}, server, server.PublicNet.IPv4.IP)
+	if target.Host != server.CloudID || !target.NoControlMaster || !strings.Contains(target.ProxyCommand, "AWS-StartSSHSession") || strings.Contains(target.ProxyCommand, server.PublicNet.IPv4.IP) {
+		t.Fatalf("SSM target=%+v", target)
+	}
+	direct := awsSSHTarget(core.Config{Provider: "aws", AWSSSHTransport: core.AWSSSHTransportDirect}, server, server.PublicNet.IPv4.IP)
+	if direct.Host != server.PublicNet.IPv4.IP || direct.ProxyCommand != "" {
+		t.Fatalf("direct target=%+v", direct)
+	}
+}
+
 func TestProviderAdvertisesRunSessionContract(t *testing.T) {
 	spec := (Provider{}).Spec()
 	for _, feature := range []core.Feature{core.FeatureSSH, core.FeatureCleanup, core.FeatureRunSession} {
@@ -306,5 +371,53 @@ func TestPrepareLeaseClaimEndpointPreservesCleanupIdentity(t *testing.T) {
 	}
 	if prepared.Labels["aws_key_pair_id"] != "" || prepared.Labels["aws_account_id"] != "" {
 		t.Fatalf("labels=%v, must not promote mutable cloud tags into cleanup authority", prepared.Labels)
+	}
+}
+
+func TestAWSReadinessStatusUsesExistingBootOwners(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX guest observer")
+	}
+	for _, tc := range []struct {
+		name, failed, pid, expected, activating string
+		workspace, bootstrapped                 bool
+	}{
+		{name: "slow ownership repair", pid: "123", expected: "pending ownership-repair"},
+		{name: "bootstrap pending", pid: "0", expected: "pending bootstrap"},
+		{name: "cloud config pending", activating: "cloud-config.service", expected: "pending cloud-config"},
+		{name: "cloud final pending", activating: "cloud-final.service", bootstrapped: true, expected: "pending cloud-final"},
+		{name: "bootstrap terminal", failed: "crabbox-bootstrap.service", expected: "failed bootstrap"},
+		{name: "cloud final terminal", failed: "cloud-final.service", expected: "failed cloud-final"},
+		{name: "workspace terminal", failed: "crabbox-workspace-ready.service", expected: "failed workspace-ready"},
+		{name: "stale bootstrap marker still needs current boot", bootstrapped: true, expected: "pending workspace-ready"},
+		{name: "marker never establishes readiness", workspace: true, expected: "pending readiness-check"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for name, script := range map[string]string{
+				"systemctl": "#!/bin/sh\ncase \"$1\" in is-failed) [ \"$3\" = \"$FIXTURE_FAILED\" ];; show) if [ \"$2\" = --property=ActiveState ]; then [ \"$4\" = \"$FIXTURE_ACTIVATING\" ] && echo activating; else printf '%s\\n' \"$FIXTURE_PID\"; fi;; cat) exit 0;; *) exit 1;; esac\n",
+				"pgrep":     "#!/bin/sh\n[ \"$1 $2 $3 $4\" = '-P 123 -x chown' ]\n",
+			} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for path, present := range map[string]bool{"workspace": tc.workspace, "bootstrapped": tc.bootstrapped} {
+				if present {
+					if err := os.WriteFile(filepath.Join(dir, path), nil, 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			script := strings.NewReplacer("/run/crabbox/workspace-ready", filepath.Join(dir, "workspace"), "/var/lib/crabbox/bootstrapped", filepath.Join(dir, "bootstrapped")).Replace(awsLinuxReadinessStatus)
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, "sh", "-c", script)
+			cmd.Env = append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"), "FIXTURE_FAILED="+tc.failed, "FIXTURE_PID="+tc.pid, "FIXTURE_ACTIVATING="+tc.activating)
+			out, err := cmd.CombinedOutput()
+			if err != nil || strings.TrimSpace(string(out)) != tc.expected {
+				t.Fatalf("observer=%q error=%v want %q", out, err, tc.expected)
+			}
+		})
 	}
 }

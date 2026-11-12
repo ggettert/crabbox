@@ -17,6 +17,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const (
+	AWSSSHTransportDirect = "direct"
+	AWSSSHTransportSSM    = "ssm"
+)
+
 type Config struct {
 	claimLegacyRoot               string
 	ManagedHost                   string
@@ -80,6 +85,7 @@ type Config struct {
 	Image                         string
 	imageExplicit                 bool
 	AWSRegion                     string
+	AWSSSHTransport               string
 	AWSStockImage                 bool
 	AWSAMI                        string
 	AWSSnapshot                   string
@@ -413,11 +419,13 @@ type ExternalDesktopConfig struct {
 }
 
 type AsciiBoxConfig struct {
-	NoEnv   bool
-	APIKey  string
-	BaseURL string
-	CLIPath string
-	Workdir string
+	NoSnapshots bool
+	Visibility  string
+	NoEnv       bool
+	APIKey      string
+	BaseURL     string
+	CLIPath     string
+	Workdir     string
 }
 
 const DefaultCloudflareDynamicWorkersCompatibilityDate = "2026-06-12"
@@ -1611,6 +1619,7 @@ func baseConfig() Config {
 		Location:                "fsn1",
 		Image:                   hetznerImage,
 		AWSRegion:               "eu-west-1",
+		AWSSSHTransport:         AWSSSHTransportDirect,
 		AWSRootGB:               0,
 		AWSLambdaMicroVM:        defaultAWSLambdaMicroVMConfig(),
 		Azure:                   initialAzureConfig(azureImage),
@@ -1928,6 +1937,7 @@ type fileHetznerConfig struct {
 
 type fileAWSConfig struct {
 	Region          string   `yaml:"region,omitempty"`
+	SSHTransport    string   `yaml:"sshTransport,omitempty"`
 	AMI             string   `yaml:"ami,omitempty"`
 	StockImage      *bool    `yaml:"stockImage,omitempty"`
 	SecurityGroupID string   `yaml:"securityGroupId,omitempty"`
@@ -2046,10 +2056,12 @@ type fileExternalConfig struct {
 }
 
 type fileAsciiBoxConfig struct {
-	NoEnv   *bool  `yaml:"noEnv,omitempty"`
-	BaseURL string `yaml:"baseUrl,omitempty"`
-	CLIPath string `yaml:"cliPath,omitempty"`
-	Workdir string `yaml:"workdir,omitempty"`
+	NoSnapshots *bool   `yaml:"noSnapshots,omitempty"`
+	Visibility  *string `yaml:"visibility,omitempty"`
+	NoEnv       *bool   `yaml:"noEnv,omitempty"`
+	BaseURL     string  `yaml:"baseUrl,omitempty"`
+	CLIPath     string  `yaml:"cliPath,omitempty"`
+	Workdir     string  `yaml:"workdir,omitempty"`
 }
 
 type fileCloudflareDynamicWorkersConfig struct {
@@ -2810,6 +2822,7 @@ func applyFileConfigWithTrustAndProviderSource(cfg *Config, file fileConfig, tru
 			cfg.AWSStockImage = *file.AWS.StockImage
 			recordConfigInput(cfg, "aws", inputSource, true)
 		}
+		configInputFileString(cfg, "aws", inputSource, &cfg.AWSSSHTransport, file.AWS.SSHTransport)
 		configInputFileString(cfg, "aws", inputSource, &cfg.AWSAMI, file.AWS.AMI)
 		configInputFileString(cfg, "aws", inputSource, &cfg.AWSSGID, file.AWS.SecurityGroupID)
 		configInputFileString(cfg, "aws", inputSource, &cfg.AWSSubnetID, file.AWS.SubnetID)
@@ -3537,6 +3550,14 @@ func applyFileConfigWithTrustAndProviderSource(cfg *Config, file fileConfig, tru
 		}
 	}
 	if file.AsciiBox != nil {
+		if file.AsciiBox.NoSnapshots != nil {
+			cfg.AsciiBox.NoSnapshots = *file.AsciiBox.NoSnapshots
+			recordConfigInput(cfg, "ascii-box", inputSource, true)
+		}
+		if file.AsciiBox.Visibility != nil {
+			cfg.AsciiBox.Visibility = *file.AsciiBox.Visibility
+			recordConfigInput(cfg, "ascii-box", inputSource, true)
+		}
 		if file.AsciiBox.NoEnv != nil {
 			cfg.AsciiBox.NoEnv = *file.AsciiBox.NoEnv
 			recordConfigInput(cfg, "ascii-box", inputSource, true)
